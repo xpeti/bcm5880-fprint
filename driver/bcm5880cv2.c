@@ -26,6 +26,7 @@ struct _FpiDeviceBcm5880Cv2
   gsize       cmd_len;
   gboolean    enc;           /* current command/response is secure-session wrapped */
   gboolean    drain_extra;   /* read one extra async status (0x85 event) after the body */
+  guint       status_skips;  /* async finger events (st=3) skipped while awaiting a cmd status */
   guint8      status[8];      /* [status u32][len u32] from EP 0x85 */
   guint8     *resp;           /* response body buffer (plaintext after unwrap) */
   gsize       resp_len;
@@ -100,7 +101,14 @@ cv_ssm_run (FpiSsm *ssm, FpDevice *dev)
         guint32 st, len;
         memcpy (&st,  self->status + 0, 4); st  = GUINT32_FROM_LE (st);
         memcpy (&len, self->status + 4, 4); len = GUINT32_FROM_LE (len);
-        fp_warn ("cv status=0x%x len=%u enc=%d", st, len, self->enc);
+        fp_dbg ("cv status=0x%x len=%u enc=%d", st, len, self->enc);
+        /* 0x85 carries both command results AND async finger events (st=3, len=0). A late
+         * event can arrive on this channel just before a command's real status; skip it
+         * and re-read rather than treating it as a protocol error. */
+        if (st == 3 && len == 0)
+          {
+            if (self->status_skips++ < 8) { fpi_ssm_jump_to_state (ssm, CV_STATUS); return; }
+          }
         if (st != 0)
           {
             fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
@@ -160,7 +168,7 @@ cv_cmd (FpDevice *dev, guint8 *cmd, gsize len)
 {
   FpiDeviceBcm5880Cv2 *self = FPI_DEVICE_BCM5880CV2 (dev);
   g_clear_pointer (&self->cmd, g_free);
-  self->cmd = cmd; self->cmd_len = len;
+  self->cmd = cmd; self->cmd_len = len; self->status_skips = 0;
   FpiSsm *s = fpi_ssm_new (dev, cv_ssm_run, CV_NUM);
   fpi_ssm_start (s, cv_cmd_cb);
 }
@@ -300,7 +308,7 @@ dev_close (FpDevice *device)
  * secure-session capture); 0x8a/0x6c/0x68 reuse the CV3 plaintext-capture structure
  * (same enrollment semantics). The commit (0x6e) is gated by EN_COMMIT_ENABLED while the
  * capture loop and completion signal are being validated on real hardware. */
-#define EN_COMMIT_ENABLED 0
+#define EN_COMMIT_ENABLED 1
 #define EN_MAX_STAGES      8
 #define EN_MAX_POLLS       40   /* ~1.5 s each -> ~60 s to present a finger per stage */
 
@@ -407,10 +415,10 @@ enroll_run (FpiSsm *ssm, FpDevice *dev)
 #if EN_COMMIT_ENABLED
       {
         guint8 body[64]; guint8 *p = body;
-        p = tlv_put (p, self->obj_handle, 4);
-        guint8 zero20[20] = {0}; p = tlv_put (p, zero20, 20);
-        /* trailing fixed fields from the capture: {00000000 02000000}{00000000 02000000}{00000000 03000000} */
-        static const guint8 tail[24] = {0,0,0,0, 2,0,0,0, 0,0,0,0, 2,0,0,0, 0,0,0,0, 3,0,0,0};
+        p = tlv_put (p, self->obj_handle, 4);                 /* {tag0 len4 handle} */
+        guint8 zero20[20] = {0}; p = tlv_put (p, zero20, 20); /* {tag0 len0x14 zeros} */
+        /* trailing fields verbatim from the capture: {tag2 len0}{tag2 len0}{tag3 len0} */
+        static const guint8 tail[24] = { 2,0,0,0, 0,0,0,0,  2,0,0,0, 0,0,0,0,  3,0,0,0, 0,0,0,0 };
         memcpy (p, tail, 24); p += 24;
         cv_enc (dev, 0x6e, 0x0440, body, 64, FALSE);
       }
@@ -443,7 +451,12 @@ enroll_done (FpiSsm *ssm, FpDevice *dev, GError *error)
   if (error)
     fpi_device_enroll_complete (dev, NULL, error);
   else
-    fpi_device_enroll_complete (dev, g_object_ref (self->enroll_print), NULL);
+    {
+      /* match-on-chip: the template lives on the device; keep a reference print */
+      fpi_print_set_type (self->enroll_print, FPI_PRINT_RAW);
+      fpi_print_set_device_stored (self->enroll_print, TRUE);
+      fpi_device_enroll_complete (dev, g_object_ref (self->enroll_print), NULL);
+    }
 }
 
 static void

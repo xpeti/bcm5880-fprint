@@ -31,8 +31,9 @@ reproduces its cryptography.
 | Decrypt a real Windows session end-to-end | ✅ `decrypt.py` |
 | **Native `libfprint` TOD driver — secure session end-to-end** | ✅ **`driver/` — loads in `fprintd`, binds the device, runs the full handshake (`0x39`→`0x82`→`0x23`→`0x24`), chip accepts the RSA key transport, session derived; chip healthy** |
 | **Native encrypted commands round-trip on the chip** | ✅ **wrapped `0x02` open-object + `0x04` close verified: chip replies decrypt to valid data (object handle); requires reading the chip modulus little-endian** |
-| Session → enroll → **encrypted commit** → verify | 🚧 enroll capture loop implemented; needs a finger to validate, then commit (`0x6e`) + verify |
-| `libfprint` driver packaging (meson + udev) | 🚧 pending |
+| **Enroll on the chip → encrypted commit (`0x6e`)** | ✅ **works end-to-end: 8-stage capture loop + the encrypted commit the CV3 driver never could do — template stored, chip healthy** |
+| Verify / identify (match-on-chip) | 🚧 next |
+| `libfprint` driver build | ✅ `driver/Makefile` |
 
 **The hard part is done:** the ControlVault 2 "secure session" cryptography — the
 exact reason the device couldn't be driven on Linux — has been completely reverse
