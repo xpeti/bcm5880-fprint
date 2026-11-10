@@ -170,12 +170,47 @@ See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the full write-up.
 
 No Dell/Broadcom binaries or decompiled proprietary code are included.
 
-## Build & run the probe
+## Setup on Fedora
+
+Interface 0 is shared with the chip's contactless/NFC CCID. If you also run the NFC
+side ([`bcm5880-nfc`](../bcm5880-nfc)), stop its daemon before using the fingerprint
+path, and vice-versa.
 
 ```bash
-sudo dnf install libusb1-devel openssl-devel     # or libusb-1.0-0-dev libssl-dev
+# 1. Build dependencies
+sudo dnf install git make gcc libusb1-devel openssl-devel python3-pycryptodomex python3-pyusb
+
+# 2. Build the libusb probe
 make
-# free interface 0 from the NFC stack first:
+
+# 3. Free interface 0 (the NFC stack / fprintd may hold it)
+sudo systemctl stop pcscd pcscd.socket fprintd
+
+# 4. Talk to the chip: handshake, pull its public key, ECDH
+sudo ./probe
+
+# 5. Prove the full secure session end-to-end on your chip
+sudo python3 session_test.py        # expect: "*** SESSION WORKS ON THE CHIP ***"
+```
+
+If `session_test.py` prints the success line and `lsusb -d 0a5c:5834` still shows the
+device afterwards, your chip speaks the exact protocol in this repo.
+
+> **Recovery:** if a bad command ever drops the chip to `0a5c:5831` (bootloader),
+> fully **power the laptop off and cold-boot** (a warm reboot is not enough) — the
+> firmware is re-uploaded by the BIOS on a cold start.
+
+### fprintd / `libfprint` integration — work in progress
+
+The goal is a `libfprint`-compatible driver so `fprintd-enroll` / `fprintd-verify`
+just work. See [`docs/DRIVER.md`](docs/DRIVER.md) for the design (a secure-session
+layer in front of the stock ControlVault driver) and the current state. Install
+instructions will land here once the driver enrolls and verifies.
+
+## Build & run the probe (minimal)
+
+```bash
+make
 sudo systemctl stop pcscd pcscd.socket fprintd
 sudo ./probe
 ```
