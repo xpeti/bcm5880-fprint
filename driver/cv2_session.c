@@ -28,15 +28,23 @@ void cv2_session_init(cv2_session *s, const uint8_t chip_nonce[20],
 int cv2_build_rsa_block(const uint8_t modulus[256], const uint8_t host_nonce[20],
                         uint8_t out[256])
 {
+    /* PKCS#1 v1.5 type-2 padding: 00 02 [233 non-zero random] 00 [nonce 20] */
+    uint8_t padded[256];
+    padded[0] = 0x00; padded[1] = 0x02;
+    for (int i = 2; i < 256 - 20 - 1; i++) { uint8_t b; do { RAND_bytes(&b, 1); } while (b == 0); padded[i] = b; }
+    padded[256 - 20 - 1] = 0x00;
+    memcpy(padded + 256 - 20, host_nonce, 20);
+    /* textbook RSA: c = padded^e mod n  (avoids OpenSSL-3 legacy RSA-object quirks) */
+    BIGNUM *m = BN_bin2bn(padded, 256, NULL);
     BIGNUM *n = BN_bin2bn(modulus, 256, NULL);
     BIGNUM *e = NULL; BN_dec2bn(&e, "65537");
-    RSA *rsa = RSA_new();
-    RSA_set0_key(rsa, n, e, NULL);
-    int r = RSA_public_encrypt(20, host_nonce, out, rsa, RSA_PKCS1_PADDING);
-    RSA_free(rsa);
-    if (r != 256) return -1;
-    for (int i = 0; i < 128; i++) { uint8_t t = out[i]; out[i] = out[255-i]; out[255-i] = t; } /* CryptoAPI */
-    return 0;
+    BIGNUM *c = BN_new();
+    BN_CTX *ctx = BN_CTX_new();
+    int ok = BN_mod_exp(c, m, e, n, ctx);
+    if (ok) { BN_bn2binpad(c, out, 256);
+              for (int i = 0; i < 128; i++) { uint8_t t = out[i]; out[i] = out[255-i]; out[255-i] = t; } }
+    BN_free(m); BN_free(n); BN_free(e); BN_free(c); BN_CTX_free(ctx);
+    return ok ? 0 : -1;
 }
 
 int cv2_wrap(cv2_session *s, uint16_t cmdid, uint16_t driver_flags,
