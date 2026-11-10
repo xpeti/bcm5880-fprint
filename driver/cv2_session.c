@@ -34,9 +34,12 @@ int cv2_build_rsa_block(const uint8_t modulus[256], const uint8_t host_nonce[20]
     for (int i = 2; i < 256 - 20 - 1; i++) { uint8_t b; do { RAND_bytes(&b, 1); } while (b == 0); padded[i] = b; }
     padded[256 - 20 - 1] = 0x00;
     memcpy(padded + 256 - 20, host_nonce, 20);
-    /* textbook RSA: c = padded^e mod n  (avoids OpenSSL-3 legacy RSA-object quirks) */
+    /* textbook RSA: c = padded^e mod n  (avoids OpenSSL-3 legacy RSA-object quirks).
+     * NB: the chip returns its modulus in LITTLE-endian (CryptoAPI blob order), so read
+     * it with BN_lebin2bn — this is what makes the chip recover the right host nonce and
+     * derive the matching session key (verified on-chip; big-endian gives a wrong key). */
     BIGNUM *m = BN_bin2bn(padded, 256, NULL);
-    BIGNUM *n = BN_bin2bn(modulus, 256, NULL);
+    BIGNUM *n = BN_lebin2bn(modulus, 256, NULL);
     BIGNUM *e = NULL; BN_dec2bn(&e, "65537");
     BIGNUM *c = BN_new();
     BN_CTX *ctx = BN_CTX_new();

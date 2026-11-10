@@ -45,7 +45,7 @@ try:
     st,r=cv(p,"0x23");
     handle=r[0x10:0x14]; param=r[0x2c:]; modulus=param[:256]; chip_nonce=param[-24:-4]
     print("  handle=%s chip_nonce=%s"%(handle.hex(),chip_nonce.hex()))
-    n=int.from_bytes(modulus,'big')
+    n=int.from_bytes(modulus,'little')   # chip returns modulus in LITTLE-endian (CryptoAPI blob order)
     # PKCS1 v1.5 pad (type 2) then RSA, CryptoAPI reverses the ciphertext
     import os
     ps=bytes((b or 1) for b in os.urandom(256-3-20))

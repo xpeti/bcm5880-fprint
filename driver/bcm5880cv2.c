@@ -24,10 +24,17 @@ struct _FpiDeviceBcm5880Cv2
   /* per-command scratch */
   guint8     *cmd;            /* command to send (owned) */
   gsize       cmd_len;
+  gboolean    enc;           /* current command/response is secure-session wrapped */
+  gboolean    drain_extra;   /* read one extra async status (0x85 event) after the body */
   guint8      status[8];      /* [status u32][len u32] from EP 0x85 */
-  guint8     *resp;           /* response body buffer */
+  guint8     *resp;           /* response body buffer (plaintext after unwrap) */
   gsize       resp_len;
-  void      (*cmd_done)(FpDevice *dev);  /* called when a cv command round-trip completes */
+  /* enroll bookkeeping */
+  guint8      obj_handle[4];  /* object-session handle from the 0x02 response body */
+  guint       enroll_stage;   /* completed capture cycles */
+  guint       poll_count;     /* 0x66 polls waiting for the current finger press */
+  guint8      digest[20];     /* last 0x66 image digest */
+  FpPrint    *enroll_print;
 };
 G_DECLARE_FINAL_TYPE (FpiDeviceBcm5880Cv2, fpi_device_bcm5880cv2, FPI, DEVICE_BCM5880CV2, FpDevice)
 G_DEFINE_TYPE (FpiDeviceBcm5880Cv2, fpi_device_bcm5880cv2, FP_TYPE_DEVICE)
@@ -46,13 +53,32 @@ static const FpIdEntry id_table[] = {
 /* ---- async CV command: OUT(0x01) -> status(0x85) -> body(0x81) ----
  * Implemented as a tiny 3-state SSM chained via fpi_usb_transfer. The result
  * (status + body) is left in the device struct for the caller's continuation. */
-enum { CV_SEND, CV_STATUS, CV_BODY, CV_NUM };
+enum { CV_SEND, CV_STATUS, CV_BODY, CV_DRAIN, CV_NUM };
+
+/* completion for the optional trailing async-event read: ignore timeouts/errors
+ * (the event is best-effort), then finish the command SSM. */
+static void
+cv_drain_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
+{
+  if (error)
+    {
+      fp_warn ("cv drain: no/failed async event (%s) — ok", error->message);
+      g_error_free (error);
+    }
+  else
+    {
+      FpiDeviceBcm5880Cv2 *self = FPI_DEVICE_BCM5880CV2 (dev);
+      guint32 st = GUINT32_FROM_LE (*(guint32 *) transfer->buffer);
+      fp_warn ("cv drain: async event st=0x%x", st);
+      (void) self;
+    }
+  fpi_ssm_mark_completed (transfer->ssm);
+}
 
 static void
 cv_ssm_run (FpiSsm *ssm, FpDevice *dev)
 {
   FpiDeviceBcm5880Cv2 *self = FPI_DEVICE_BCM5880CV2 (dev);
-  GUsbDevice *usb = fpi_device_get_usb_device (dev);
   FpiUsbTransfer *t;
 
   switch (fpi_ssm_get_cur_state (ssm))
@@ -74,7 +100,7 @@ cv_ssm_run (FpiSsm *ssm, FpDevice *dev)
         guint32 st, len;
         memcpy (&st,  self->status + 0, 4); st  = GUINT32_FROM_LE (st);
         memcpy (&len, self->status + 4, 4); len = GUINT32_FROM_LE (len);
-        fp_warn ("cv status=0x%x len=%u", st, len);
+        fp_warn ("cv status=0x%x len=%u enc=%d", st, len, self->enc);
         if (st != 0)
           {
             fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
@@ -84,12 +110,37 @@ cv_ssm_run (FpiSsm *ssm, FpDevice *dev)
         g_clear_pointer (&self->resp, g_free);
         self->resp = g_malloc0 (len ? len : 1);
         self->resp_len = len;
-        if (len == 0) { fpi_ssm_mark_completed (ssm); return; }
+        if (len == 0) { fpi_ssm_jump_to_state (ssm, CV_DRAIN); return; }
         t = fpi_usb_transfer_new (dev);
         fpi_usb_transfer_fill_bulk_full (t, EP_IN, self->resp, len, NULL);
         t->ssm = ssm;
         fpi_usb_transfer_submit (t, CV_TIMEOUT, NULL, fpi_ssm_usb_transfer_cb, NULL);
       }
+      break;
+    case CV_DRAIN:
+      /* unwrap the (now complete) encrypted response body in place */
+      if (self->enc && self->resp_len >= 0x2c)
+        {
+          guint8 body[4096];
+          int bl = cv2_unwrap (&self->sess, self->resp, self->resp_len, body, sizeof body);
+          fp_dbg ("cv unwrap -> %d body bytes", bl);
+          g_clear_pointer (&self->resp, g_free);
+          self->resp = g_memdup2 (body, bl > 0 ? bl : 1);
+          self->resp_len = bl > 0 ? bl : 0;
+        }
+      /* some commands (0x66 capture) emit a trailing async status event; drain it.
+       * It may or may not arrive, so a short timeout is non-fatal (see cv_drain_cb). */
+      if (self->drain_extra)
+        {
+          self->drain_extra = FALSE;
+          t = fpi_usb_transfer_new (dev);
+          fpi_usb_transfer_fill_interrupt (t, EP_ST, 8);
+          t->ssm = ssm;
+          /* doubles as the finger-present wait during enroll polling */
+          fpi_usb_transfer_submit (t, 1500, NULL, cv_drain_cb, NULL);
+          return;
+        }
+      fpi_ssm_mark_completed (ssm);
       break;
     }
 }
@@ -112,6 +163,47 @@ cv_cmd (FpDevice *dev, guint8 *cmd, gsize len)
   self->cmd = cmd; self->cmd_len = len;
   FpiSsm *s = fpi_ssm_new (dev, cv_ssm_run, CV_NUM);
   fpi_ssm_start (s, cv_cmd_cb);
+}
+
+/* ---- TLV body helpers (fields are [u32 tag=0][u32 len][len bytes]) ---- */
+static guint8 *
+tlv_put (guint8 *p, const void *val, guint32 len)
+{
+  guint32 t = 0;
+  memcpy (p, &t, 4);                 p += 4;
+  guint32 l = GUINT32_TO_LE (len);   memcpy (p, &l, 4); p += 4;
+  if (len) { memcpy (p, val, len);   p += len; }
+  return p;
+}
+
+/* Send a plaintext CV command (handshake-era framing): 0x2c header + body. */
+static void
+cv_plain (FpDevice *dev, guint16 cmd, guint16 flags, const guint8 handle[4],
+          const guint8 *body, guint32 bodylen, gboolean drain_extra)
+{
+  FpiDeviceBcm5880Cv2 *self = FPI_DEVICE_BCM5880CV2 (dev);
+  gsize n = 0x2c + bodylen;
+  guint8 *c = g_malloc0 (n);
+  c[0] = 1; { guint32 v = GUINT32_TO_LE (n); memcpy (c + 4, &v, 4); }
+  c[8] = cmd; c[9] = cmd >> 8; c[0x0a] = flags; c[0x0b] = flags >> 8; c[0x0c] = 2;
+  if (handle) memcpy (c + 0x10, handle, 4);
+  { guint32 v = GUINT32_TO_LE (bodylen); memcpy (c + 0x28, &v, 4); }
+  if (bodylen) memcpy (c + 0x2c, body, bodylen);
+  self->enc = FALSE; self->drain_extra = drain_extra;
+  cv_cmd (dev, c, n);
+}
+
+/* Send an encrypted (secure-session) CV command: cv2_wrap handles header+handle. */
+static void
+cv_enc (FpDevice *dev, guint16 cmd, guint16 cv3_flags,
+        const guint8 *body, guint32 bodylen, gboolean drain_extra)
+{
+  FpiDeviceBcm5880Cv2 *self = FPI_DEVICE_BCM5880CV2 (dev);
+  guint8 buf[4096];
+  int n = cv2_wrap (&self->sess, cmd, cv3_flags, body, bodylen, buf, sizeof buf);
+  if (n < 0) { fpi_ssm_mark_failed (self->task_ssm, fpi_device_error_new (FP_DEVICE_ERROR_GENERAL)); return; }
+  self->enc = TRUE; self->drain_extra = drain_extra;
+  cv_cmd (dev, g_memdup2 (buf, n), n);
 }
 
 /* ---- open: handshake 0x39 -> 0x82 -> 0x23 -> 0x24 -> derive session ---- */
@@ -198,10 +290,174 @@ dev_close (FpDevice *device)
   fpi_device_close_complete (device, error);
 }
 
-/* enroll/verify/identify: next milestone (drive capture + wrap commands via cv2_wrap) */
-static void dev_enroll   (FpDevice *d){ fpi_device_enroll_complete   (d, NULL, fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED, "enroll WIP")); }
+/* ---- enroll ----
+ * Secure session is already live (from dev_open). In CV2 every object/enroll command
+ * is wrapped in the session (unlike CV3, which sends them plaintext). Flow mirrors the
+ * captured enrollment: 0x02 open object -> 0x8a begin -> {0x66 poll, 0x6c submit}* ->
+ * 0x68 end -> 0x6e commit -> 0x04 close.
+ *
+ * Capture bodies are CV2 forms where known (0x02/0x66, decrypted from the Windows
+ * secure-session capture); 0x8a/0x6c/0x68 reuse the CV3 plaintext-capture structure
+ * (same enrollment semantics). The commit (0x6e) is gated by EN_COMMIT_ENABLED while the
+ * capture loop and completion signal are being validated on real hardware. */
+#define EN_COMMIT_ENABLED 0
+#define EN_MAX_STAGES      8
+#define EN_MAX_POLLS       40   /* ~1.5 s each -> ~60 s to present a finger per stage */
+
+/* 0x02 open-object body (CV2): {tag0 len4 = 0x4d} {tag1 len0}x3. The response carries the
+ * object handle (= session handle). */
+static const guint8 BODY_02[] = {
+  0x00,0x00,0x00,0x00, 0x04,0x00,0x00,0x00, 0x4d,0x00,0x00,0x00,
+  0x01,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
+  0x01,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
+  0x01,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
+};
+/* 0x8a begin / 0x68 end: {tag0 len4 = 0}. */
+static const guint8 BODY_8A68[] = {
+  0x00,0x00,0x00,0x00, 0x04,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
+};
+
+/* 0x66 capture-poll body (CV2): {tag0 len4 = obj_handle}{tag0 len4 = 1}{tag0 len4 = 0x23}. */
+static guint8 *
+build_66 (const guint8 handle[4], gsize *len)
+{
+  guint8 *b = g_malloc0 (36); guint8 *p = b;
+  p = tlv_put (p, handle, 4);
+  guint32 one = GUINT32_TO_LE (1);     p = tlv_put (p, &one, 4);
+  guint32 k23 = GUINT32_TO_LE (0x23);  p = tlv_put (p, &k23, 4);
+  *len = 36; return b;
+}
+/* 0x6c submit-sample body: {tag0 len4 = obj_handle}{tag0 len0x14 = digest}{tag2 len0}. */
+static guint8 *
+build_6c (const guint8 handle[4], const guint8 digest[20], gsize *len)
+{
+  guint8 *b = g_malloc0 (48); guint8 *p = b;
+  p = tlv_put (p, handle, 4);
+  p = tlv_put (p, digest, 20);
+  guint32 tag2 = GUINT32_TO_LE (2); memcpy (p, &tag2, 4); p += 4; /* tag=2 */
+  memset (p, 0, 4); p += 4;                                       /* len=0 */
+  *len = 48; return b;
+}
+
+enum { EN_OPEN, EN_BEGIN, EN_POLL, EN_SUBMIT, EN_END, EN_COMMIT, EN_CLOSE, EN_DONE, EN_NUM };
+
+static void
+enroll_run (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceBcm5880Cv2 *self = FPI_DEVICE_BCM5880CV2 (dev);
+  fp_dbg ("enroll SSM state %d (stage %u)", fpi_ssm_get_cur_state (ssm), self->enroll_stage);
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case EN_OPEN:
+      cv_enc (dev, 0x02, 0x0440, BODY_02, sizeof BODY_02, FALSE);
+      break;
+    case EN_BEGIN:
+      {
+        guint8 *r = self->resp; gsize rl = self->resp_len;
+        if (rl < 12) { fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_PROTO)); return; }
+        memcpy (self->obj_handle, r + 8, 4);
+        fp_warn ("enroll: object handle = %02x%02x%02x%02x",
+                 self->obj_handle[0], self->obj_handle[1], self->obj_handle[2], self->obj_handle[3]);
+        cv_enc (dev, 0x8a, 0x0440, BODY_8A68, sizeof BODY_8A68, FALSE);
+      }
+      break;
+    case EN_POLL:
+      {
+        /* blocks on the chip until a finger is present; returns a 20-byte image digest.
+         * The trailing async status event is drained (drain_extra=TRUE). */
+        gsize n; guint8 *b = build_66 (self->obj_handle, &n);
+        cv_enc (dev, 0x66, 0x0442, b, n, TRUE);
+        g_free (b);
+      }
+      break;
+    case EN_SUBMIT:
+      {
+        /* 0x66 response body: {tag0 len0x14 = digest} -> digest at +8.
+         * 0x66 is non-blocking: with no finger it returns an empty body, so keep polling
+         * (the drain in EN_POLL waits ~1.5 s on the finger-event interrupt between tries). */
+        guint8 *r = self->resp; gsize rl = self->resp_len;
+        if (rl < 28)
+          {
+            if (++self->poll_count > EN_MAX_POLLS)
+              { fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL, "no finger detected (timeout)")); return; }
+            fpi_ssm_jump_to_state (ssm, EN_POLL);
+            return;
+          }
+        self->poll_count = 0;
+        memcpy (self->digest, r + 8, 20);
+        fp_warn ("enroll stage %u: got digest %02x%02x%02x%02x…",
+                 self->enroll_stage, self->digest[0], self->digest[1], self->digest[2], self->digest[3]);
+        gsize n; guint8 *b = build_6c (self->obj_handle, self->digest, &n);
+        cv_enc (dev, 0x6c, 0x0440, b, n, FALSE);
+        g_free (b);
+      }
+      break;
+    case EN_END:
+      {
+        /* 0x6c submit done; report progress. Loop until EN_MAX_STAGES, then finish. */
+        self->enroll_stage++;
+        fp_warn ("enroll: stage %u/%u complete (0x6c resp %zu B)", self->enroll_stage, EN_MAX_STAGES, self->resp_len);
+        fpi_device_enroll_progress (dev, self->enroll_stage, NULL, NULL);
+        if (self->enroll_stage < EN_MAX_STAGES)
+          { fpi_ssm_jump_to_state (ssm, EN_POLL); return; }
+        cv_enc (dev, 0x68, 0x0440, BODY_8A68, sizeof BODY_8A68, FALSE);
+      }
+      break;
+    case EN_COMMIT:
+#if EN_COMMIT_ENABLED
+      {
+        guint8 body[64]; guint8 *p = body;
+        p = tlv_put (p, self->obj_handle, 4);
+        guint8 zero20[20] = {0}; p = tlv_put (p, zero20, 20);
+        /* trailing fixed fields from the capture: {00000000 02000000}{00000000 02000000}{00000000 03000000} */
+        static const guint8 tail[24] = {0,0,0,0, 2,0,0,0, 0,0,0,0, 2,0,0,0, 0,0,0,0, 3,0,0,0};
+        memcpy (p, tail, 24); p += 24;
+        cv_enc (dev, 0x6e, 0x0440, body, 64, FALSE);
+      }
+      break;
+#else
+      fpi_ssm_jump_to_state (ssm, EN_CLOSE);
+      break;
+#endif
+    case EN_CLOSE:
+      {
+        guint8 body[12]; tlv_put (body, self->obj_handle, 4);
+        cv_enc (dev, 0x04, 0x0040, body, sizeof body, FALSE);
+      }
+      break;
+    case EN_DONE:
+      fpi_ssm_mark_completed (ssm);
+      break;
+    }
+}
+
+static void
+enroll_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpiDeviceBcm5880Cv2 *self = FPI_DEVICE_BCM5880CV2 (dev);
+  fp_warn ("enroll_done: %s", error ? error->message : "capture loop OK");
+  if (!error && !EN_COMMIT_ENABLED)
+    error = fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
+                                      "capture loop validated (%u stages); commit disabled this build",
+                                      self->enroll_stage);
+  if (error)
+    fpi_device_enroll_complete (dev, NULL, error);
+  else
+    fpi_device_enroll_complete (dev, g_object_ref (self->enroll_print), NULL);
+}
+
+static void
+dev_enroll (FpDevice *dev)
+{
+  FpiDeviceBcm5880Cv2 *self = FPI_DEVICE_BCM5880CV2 (dev);
+  fpi_device_get_enroll_data (dev, &self->enroll_print);
+  self->enroll_stage = 0;
+  self->poll_count = 0;
+  self->task_ssm = fpi_ssm_new (dev, enroll_run, EN_NUM);
+  fpi_ssm_start (self->task_ssm, enroll_done);
+}
+
 static void dev_verify   (FpDevice *d){ fpi_device_verify_complete   (d, fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED, "verify WIP")); }
-static void dev_identify (FpDevice *d){ fpi_device_identify_complete (d, fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED, "identify WIP")); }
 
 static void
 fpi_device_bcm5880cv2_init (FpiDeviceBcm5880Cv2 *self) {}
@@ -221,5 +477,7 @@ fpi_device_bcm5880cv2_class_init (FpiDeviceBcm5880Cv2Class *klass)
   dev_class->close = dev_close;
   dev_class->enroll = dev_enroll;
   dev_class->verify = dev_verify;
-  dev_class->identify = dev_identify;
+  /* identify intentionally left unset for now: advertising it makes fprintd run a
+   * duplicate-detection identify *before* enroll, which we can't satisfy yet. Enabled
+   * once the capture/match path works. */
 }

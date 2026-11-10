@@ -29,14 +29,18 @@ reproduces its cryptography.
 | **Full session crypto — understood & reproduced** | ✅ **validated offline** |
 | **Secure session established on the real chip** | ✅ **`session_test.py` — handshake, RSA key transport, encrypted command accepted, chip healthy** |
 | Decrypt a real Windows session end-to-end | ✅ `decrypt.py` |
-| Session → enroll → **encrypted commit** → verify | 🚧 implementation pending |
-| `libfprint` driver packaging | 🚧 pending |
+| **Native `libfprint` TOD driver — secure session end-to-end** | ✅ **`driver/` — loads in `fprintd`, binds the device, runs the full handshake (`0x39`→`0x82`→`0x23`→`0x24`), chip accepts the RSA key transport, session derived; chip healthy** |
+| **Native encrypted commands round-trip on the chip** | ✅ **wrapped `0x02` open-object + `0x04` close verified: chip replies decrypt to valid data (object handle); requires reading the chip modulus little-endian** |
+| Session → enroll → **encrypted commit** → verify | 🚧 enroll capture loop implemented; needs a finger to validate, then commit (`0x6e`) + verify |
+| `libfprint` driver packaging (meson + udev) | 🚧 pending |
 
 **The hard part is done:** the ControlVault 2 "secure session" cryptography — the
 exact reason the device couldn't be driven on Linux — has been completely reverse
-engineered and **verified byte-for-byte offline**. What remains is mechanical: wrap
-the (already known, plaintext-captured) enroll/commit commands in this session crypto
-and expose it through `libfprint`.
+engineered and **verified byte-for-byte offline**, and a native `libfprint` TOD
+driver (`driver/`) now establishes that session on the real chip end-to-end: it
+loads in `fprintd`, runs the full handshake, and the chip **accepts** the RSA key
+transport. What remains is mechanical: wrap the (already known, plaintext-captured)
+enroll/commit commands in this session crypto and report progress through `libfprint`.
 
 ---
 
@@ -163,6 +167,9 @@ See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the full write-up.
 | `probe.c` | libusb tool: runs the handshake, pulls the chip's P-256/RSA public key, computes an ECDH shared secret, **and always closes the session** (see the fragility note). |
 | `session_test.py` | End-to-end secure-session **proof on the real chip**: handshake → RSA `0x24` key transport → send an encrypted command → decrypt the chip's encrypted reply. One careful run; always closes the session. |
 | `decrypt.py` | Offline decryptor/validator for a captured secure session. Reproduces the key derivation, AES-128-CBC and HMAC-SHA1 exactly. |
+| `driver/bcm5880cv2.c` | Native **`libfprint` TOD driver**: async `FpDevice` subclass driving the chip over libusb via `FpiSsm` state machines. Runs the handshake and establishes the secure session in `fprintd`; enroll/verify in progress. |
+| `driver/cv2_session.[ch]` | Reusable, **pure (no-USB) session crypto** shared by the driver: key derivation, encrypted frame build/parse, and the RSA `0x24` key-transport block. Validated byte-for-byte. |
+| `driver/ARCHITECTURE.md` | Design of the driver: vfuncs, the handshake/enroll/verify state machines, and how it reuses the session crypto. |
 | `captures/win-session-detnonce.pcapng` | Windows CV2 secure session captured with a **deterministic** host RNG — the reference used to crack the crypto. |
 | `captures/linux-enroll-plaintext.pcapng` | The CV3-driver enrollment on Linux, sent in plaintext (`2300/2400/0200/6600/6e`) — the enroll/commit commands that just need wrapping in the session crypto. |
 | `chip-rsa-modulus.hex` | The example chip's RSA-2048 public modulus (device-public, for reference). |

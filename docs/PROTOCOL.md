@@ -52,11 +52,17 @@ the IV.
           selector = 1 -> ECDH P-256 path (also supported by the chip)
       response param:
           RSA path: 256-byte RSA modulus (exponent 0x10001) + info + trailing 20 B
+                    *** the modulus is LITTLE-endian (CryptoAPI blob order) ***
           ECDH path: 64-byte P-256 public point (X‖Y) + info
           ...and the chip assigns a session handle (returned at header +0x10).
           The last 20 bytes of the response param are the chip_nonce.
 0x24  key transport
-      RSA path:  param = RSA-2048(chip_pubkey, host_nonce[20])   (PKCS#1, 256 B)
+      RSA path:  param = RSA-2048(chip_pubkey, host_nonce[20])   (PKCS#1 v1.5, 256 B)
+                 build as: c = PKCS1(nonce)^e mod n, where n = int(modulus, LITTLE-endian),
+                 then reverse the 256-byte ciphertext (CryptoAPI little-endian output).
+                 Reading the modulus big-endian yields a wrong key: the chip decrypts a
+                 different host nonce, the derived session key mismatches, and the first
+                 encrypted command comes back undecryptable (observed: +0x14=15, empty body).
       ECDH path: param = [20 B nonce][64 B host P-256 public point]
 0x04  close session: param = [u32 len=4][session handle]   (ALWAYS send this)
 ```
