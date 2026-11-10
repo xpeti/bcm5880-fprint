@@ -114,8 +114,11 @@ static int wrap_send(libusb_device_handle*h,const unsigned char*cmd,int clen){
     // header
     int blob= bodylen+20+8; int pad=16-(blob%16); int ctlen=blob+pad;
     unsigned char hdr[0x2c]; memset(hdr,0,sizeof hdr);
+    // CV2 encrypted flags: keep the command's low byte, set bit0 (encrypted),
+    // force the high byte to 0x02 (CV2). CV3 uses 0x04. e.g. 0x0440->0x0241, 0x0442->0x0243.
+    unsigned eflags = ((flags & 0xff) | 1) | 0x0200;
     hdr[0]=1; put32(hdr+4,0x2c+ctlen); hdr[8]=cmdid; hdr[9]=cmdid>>8;
-    hdr[0x0a]=(flags|1); hdr[0x0b]=(flags|1)>>8; hdr[0x0c]=2;
+    hdr[0x0a]=eflags; hdr[0x0b]=eflags>>8; hdr[0x0c]=2;
     memcpy(hdr+0x10,HANDLE,4); memcpy(hdr+0x18,iv,16); put32(hdr+0x28,bodylen);
     // HMAC over header[0:0x2c] || body || counter
     unsigned char macin[0x2c+8192+4]; int mi=0;
