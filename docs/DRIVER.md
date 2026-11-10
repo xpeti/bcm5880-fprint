@@ -74,3 +74,18 @@ counter = per-session, starts 0, +1 per command
 Develop the frame builder **offline** against `../captures/` (byte-exact) before
 sending anything. Keep exactly one session open and always close it. A malformed
 secure-session command drops the chip to its bootloader until a cold power-off.
+
+## Integration findings (live testing)
+
+- The stock CV3 driver imports **synchronous** `libusb_bulk_transfer` /
+  `libusb_interrupt_transfer`, so an `LD_PRELOAD` shim CAN intercept its command
+  traffic (confirmed: the shim's interposed `libusb_bulk_transfer` fires on the
+  driver's `0x39`). libfprint *core* uses libgusb (async `libusb_submit_transfer`)
+  for enumeration, but the driver's per-command I/O is sync and interceptable.
+- **To test via fprintd** the shim must be injected into the fprintd daemon
+  (`Environment=LD_PRELOAD=…/cv2-session-shim.so` systemd drop-in, or run the daemon
+  manually so it owns the `net.reactivated.Fprint` bus name). Plain `fprintd-enroll`
+  otherwise D-Bus-activates an un-shimmed daemon.
+- The crypto is byte-exact (a standalone C test rebuilds a captured frame exactly);
+  the remaining work is debugging the in-driver `establish()` + response buffering
+  against a live enroll (needs a finger swipe).

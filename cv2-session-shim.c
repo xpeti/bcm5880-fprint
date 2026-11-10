@@ -29,6 +29,8 @@
 #define EP_IN  0x81
 #define EP_ST  0x85
 
+#define SHIMLOG(...) do{ fprintf(stderr,"[cv2-shim] " __VA_ARGS__); fflush(stderr); }while(0)
+
 static int (*real_bulk)(libusb_device_handle*,unsigned char,unsigned char*,int,int*,unsigned int);
 static int (*real_intr)(libusb_device_handle*,unsigned char,unsigned char*,int,int*,unsigned int);
 
@@ -69,14 +71,15 @@ static void derive_keys(const unsigned char*chip_nonce,const unsigned char*host_
 }
 
 static int establish(libusb_device_handle*h){
-    unsigned char r[1024];
-    if(cv_raw(h,CMD39,sizeof CMD39,r,sizeof r)<0) return -1;
-    if(cv_raw(h,CMD82,sizeof CMD82,r,sizeof r)<0) return -1;
+    unsigned char r[1024]; int x;
+    x=cv_raw(h,CMD39,sizeof CMD39,r,sizeof r); SHIMLOG("est: 0x39 -> %d\n",x); if(x<0) return -1;
+    x=cv_raw(h,CMD82,sizeof CMD82,r,sizeof r); SHIMLOG("est: 0x82 -> %d\n",x); if(x<0) return -1;
     // 0x23 get-pubkey, selector 0 (RSA)
     unsigned char c23[0x44]; memset(c23,0,sizeof c23);
     c23[0]=1; c23[4]=0x44; c23[8]=0x23; c23[0x0a]=0x41; c23[0x0c]=2; c23[0x28]=0x18;
     for(int i=0;i<20;i++) c23[0x2c+i]=i;              // host field (unused for keys)
     int rl=cv_raw(h,c23,sizeof c23,r,sizeof r);
+    SHIMLOG("est: 0x23 -> %d (need >=%d)\n",rl,0x2c+256+4);
     if(rl<0x2c+256+4) return -1;
     memcpy(HANDLE,r+0x10,4);
     unsigned char *param=r+0x2c; int plen=rl-0x2c;
@@ -97,6 +100,7 @@ static int establish(libusb_device_handle*h){
     if(cv_raw(h,c24,sizeof c24,r,sizeof r)<0) return -1;
     derive_keys(chip_nonce,host_nonce);
     COUNTER=0; sess_ready=1;
+    SHIMLOG("secure session established: handle=%02x%02x%02x%02x\n",HANDLE[0],HANDLE[1],HANDLE[2],HANDLE[3]);
     return 0;
 }
 
@@ -141,15 +145,17 @@ static int wrap_send(libusb_device_handle*h,const unsigned char*cmd,int clen){
     // send, read encrypted reply
     unsigned char rep[8192]; int rl=cv_raw(h,frame,0x2c+ctlen,rep,sizeof rep);
     if(rl<0){ buf_have=0; put32(buf_status,(uint32_t)(-rl)); put32(buf_status+4,0); return 0; }
-    // decrypt reply body, present plaintext [status 0][len=bodylen] + body
+    // decrypt reply body; present the driver a plaintext response = [header][body]
     if(rl>=0x2c){
         unsigned char*riv=rep+0x18; uint32_t rbl=le32(rep+0x28);
+        memcpy(buf_body,rep,0x2c);                 // response header
+        buf_body[0x0a]&=~1; buf_body[0x0b]&=~0x02;  // flags -> plaintext-ish (clear enc bit, 0x02->CV3)
+        buf_body[0x0b]|=0x04;
         EVP_CIPHER_CTX*d=EVP_CIPHER_CTX_new(); int dl=0,dfl=0;
         EVP_DecryptInit_ex(d,EVP_aes_128_cbc(),NULL,ENC,riv); EVP_CIPHER_CTX_set_padding(d,0);
-        EVP_DecryptUpdate(d,buf_body,&dl,rep+0x2c,rl-0x2c); EVP_DecryptFinal_ex(d,buf_body+dl,&dfl);
-        buf_body_len=rbl; put32(buf_status,0); put32(buf_status+4,0x2c+rbl); buf_have=1;
-        // rebuild a plaintext-looking header for the driver in buf? The driver reads status
-        // then body; present the decrypted body prefixed with a plaintext header copy.
+        EVP_DecryptUpdate(d,buf_body+0x2c,&dl,rep+0x2c,rl-0x2c); EVP_DecryptFinal_ex(d,buf_body+0x2c+dl,&dfl);
+        buf_body_len=0x2c+rbl; put32(buf_status,0); put32(buf_status+4,0x2c+rbl); buf_have=1;
+        SHIMLOG("  wrapped cmd 0x%02x -> chip ok, reply %u B\n",cmdid,rbl);
     } else { buf_have=0; put32(buf_status,0); put32(buf_status+4,0); }
     return 0;
 }
@@ -158,8 +164,8 @@ static int wrap_send(libusb_device_handle*h,const unsigned char*cmd,int clen){
 int libusb_bulk_transfer(libusb_device_handle*h,unsigned char ep,unsigned char*data,int len,int*transferred,unsigned int to){
     init_syms();
     if(ep==EP_OUT && len>=0x2c && data[0]==1){
-        if(!sess_ready) establish(h);
         unsigned cmd=data[8]|data[9]<<8;
+        if(!sess_ready){ SHIMLOG("first OUT (cmd 0x%02x) -> establishing session\n",cmd); establish(h); }
         if(sess_ready && needs_wrap(cmd)){
             wrap_send(h,data,len);
             if(transferred)*transferred=len;
