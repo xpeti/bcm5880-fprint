@@ -55,8 +55,12 @@ static const unsigned char CMD82[]={1,0,0,0,0x38,0,0,0,0x82,0,0x40,0,1,0,0,0,0,0
 
 // raw CV transfer via the REAL libusb; returns body length or -status
 static int cv_raw(libusb_device_handle*h,const unsigned char*cmd,int clen,unsigned char*resp,int rmax){
-    int tr=0; if(real_bulk(h,EP_OUT,(unsigned char*)cmd,clen,&tr,3000)) return -1;
-    unsigned char st[16]={0}; if(real_intr(h,EP_ST,st,sizeof st,&tr,3000)) return -1;
+    int tr=0,e;
+    e=real_bulk(h,EP_OUT,(unsigned char*)cmd,clen,&tr,3000);
+    if(e){ SHIMLOG("  cv_raw OUT err=%d (%s)\n",e,libusb_error_name(e)); return -1; }
+    unsigned char st[16]={0};
+    e=real_intr(h,EP_ST,st,sizeof st,&tr,3000);
+    if(e){ SHIMLOG("  cv_raw ST(ep85) err=%d (%s)\n",e,libusb_error_name(e)); return -1; }
     uint32_t status=le32(st),len=le32(st+4);
     if(status) return -(int)status;
     if((int)len>rmax) len=rmax;

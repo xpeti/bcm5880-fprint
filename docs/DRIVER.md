@@ -89,3 +89,23 @@ secure-session command drops the chip to its bootloader until a cold power-off.
 - The crypto is byte-exact (a standalone C test rebuilds a captured frame exactly);
   the remaining work is debugging the in-driver `establish()` + response buffering
   against a live enroll (needs a finger swipe).
+
+## ⚠️ Shim architectural blocker (resolved understanding)
+
+The `LD_PRELOAD` shim **cannot** do blocking synchronous libusb I/O from inside a
+driver callback: libfprint runs libusb's event handling on a **single GMainLoop
+thread**, and the driver's command callbacks run on that same thread. The shim's
+`establish()` does synchronous `libusb_interrupt_transfer` (EP 0x85) which blocks
+that thread, so libusb events are never pumped and the chip's reply never completes
+→ `LIBUSB_ERROR_TIMEOUT`. (The identical code works standalone — `session_test.py` —
+precisely because there is no competing async event loop.)
+
+**Consequences / the real path:**
+- A sync-I/O interposition shim is the wrong shape. Either (a) write a **from-scratch
+  libfprint driver** that performs the session using libfprint's async USB API
+  (`fpi_usb_transfer*`) — the proper, upstreamable solution — or (b) a shim that does
+  NO independent I/O: establish the session out-of-band, then only encrypt/decrypt the
+  driver's own in-place transfers. (a) is cleaner.
+- The session crypto and the on-chip protocol are fully proven (`session_test.py`),
+  so a from-scratch driver is "only" the libfprint enroll/verify state machine +
+  wiring the validated session underneath.
