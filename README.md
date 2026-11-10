@@ -27,6 +27,7 @@ reproduces its cryptography.
 | Secure-session handshake, pull chip public key | ✅ |
 | P-256 ECDH shared secret with the chip | ✅ |
 | **Full session crypto — understood & reproduced** | ✅ **validated offline** |
+| **Secure session established on the real chip** | ✅ **`session_test.py` — handshake, RSA key transport, encrypted command accepted, chip healthy** |
 | Decrypt a real Windows session end-to-end | ✅ `decrypt.py` |
 | Session → enroll → **encrypted commit** → verify | 🚧 implementation pending |
 | `libfprint` driver packaging | 🚧 pending |
@@ -160,6 +161,7 @@ See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the full write-up.
 | Path | What |
 |---|---|
 | `probe.c` | libusb tool: runs the handshake, pulls the chip's P-256/RSA public key, computes an ECDH shared secret, **and always closes the session** (see the fragility note). |
+| `session_test.py` | End-to-end secure-session **proof on the real chip**: handshake → RSA `0x24` key transport → send an encrypted command → decrypt the chip's encrypted reply. One careful run; always closes the session. |
 | `decrypt.py` | Offline decryptor/validator for a captured secure session. Reproduces the key derivation, AES-128-CBC and HMAC-SHA1 exactly. |
 | `captures/win-session-detnonce.pcapng` | Windows CV2 secure session captured with a **deterministic** host RNG — the reference used to crack the crypto. |
 | `captures/linux-enroll-plaintext.pcapng` | The CV3-driver enrollment on Linux, sent in plaintext (`2300/2400/0200/6600/6e`) — the enroll/commit commands that just need wrapping in the session crypto. |
