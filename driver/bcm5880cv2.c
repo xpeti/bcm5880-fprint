@@ -30,12 +30,14 @@ struct _FpiDeviceBcm5880Cv2
   guint8      status[8];      /* [status u32][len u32] from EP 0x85 */
   guint8     *resp;           /* response body buffer (plaintext after unwrap) */
   gsize       resp_len;
+  guint32     result_code;    /* response header +0x14 field: verify match result (0=match, 0x89=no finger, 0x85=no match) */
   /* enroll bookkeeping */
   guint8      obj_handle[4];  /* object-session handle from the 0x02 response body */
   guint       enroll_stage;   /* completed capture cycles */
   guint       poll_count;     /* 0x66 polls waiting for the current finger press */
   guint8      digest[20];     /* last 0x66 image digest */
   FpPrint    *enroll_print;
+  gboolean    verify_matched; /* verify verdict latched before closing the object */
 };
 G_DECLARE_FINAL_TYPE (FpiDeviceBcm5880Cv2, fpi_device_bcm5880cv2, FPI, DEVICE_BCM5880CV2, FpDevice)
 G_DEFINE_TYPE (FpiDeviceBcm5880Cv2, fpi_device_bcm5880cv2, FP_TYPE_DEVICE)
@@ -107,7 +109,7 @@ cv_ssm_run (FpiSsm *ssm, FpDevice *dev)
          * and re-read rather than treating it as a protocol error. */
         if (st == 3 && len == 0)
           {
-            if (self->status_skips++ < 8) { fpi_ssm_jump_to_state (ssm, CV_STATUS); return; }
+            if (self->status_skips++ < 64) { fpi_ssm_jump_to_state (ssm, CV_STATUS); return; }
           }
         if (st != 0)
           {
@@ -129,6 +131,8 @@ cv_ssm_run (FpiSsm *ssm, FpDevice *dev)
       /* unwrap the (now complete) encrypted response body in place */
       if (self->enc && self->resp_len >= 0x2c)
         {
+          /* the frame header is plaintext; +0x14 carries the verify match result */
+          self->result_code = GUINT32_FROM_LE (*(guint32 *) (self->resp + 0x14));
           guint8 body[4096];
           int bl = cv2_unwrap (&self->sess, self->resp, self->resp_len, body, sizeof body);
           fp_dbg ("cv unwrap -> %d body bytes", bl);
@@ -470,7 +474,133 @@ dev_enroll (FpDevice *dev)
   fpi_ssm_start (self->task_ssm, enroll_done);
 }
 
-static void dev_verify   (FpDevice *d){ fpi_device_verify_complete   (d, fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED, "verify WIP")); }
+/* ---- verify / identify (match-on-chip) ----
+ * The identify command 0x73 captures the finger and matches it against the stored
+ * templates internally; the result is in the response header +0x14 field:
+ *   0x00 = match, 0x89 = no finger yet (keep polling), anything else = no match.
+ * Body (plen 68) from the CV3 driver disassembly (cv_do_fingerprint_identify): the
+ * 0x48 (sensor type) and 0x53e2 (capture param) fields are essential — without them
+ * the chip just acks with no match attempt. */
+#define VER_MAX_POLLS 40
+
+static guint8 *
+build_73 (const guint8 handle[4], gsize *len)
+{
+  guint8 *b = g_malloc0 (68); guint8 *p = b;
+  guint32 v;
+  p = tlv_put (p, handle, 4);
+  v = GUINT32_TO_LE (0x48);   p = tlv_put (p, &v, 4);
+  v = GUINT32_TO_LE (0x53e2); p = tlv_put (p, &v, 4);
+  v = GUINT32_TO_LE (0);      p = tlv_put (p, &v, 4);
+  /* {tag2 len4 = 0}{tag3 len0} */
+  v = GUINT32_TO_LE (2); memcpy (p, &v, 4); p += 4; v = GUINT32_TO_LE (4); memcpy (p, &v, 4); p += 4; memset (p, 0, 4); p += 4;
+  v = GUINT32_TO_LE (3); memcpy (p, &v, 4); p += 4; memset (p, 0, 4); p += 4;
+  *len = 68; return b;
+}
+
+enum { VER_OPEN, VER_ARM, VER_CAPTURE, VER_SUBMIT, VER_CHECK, VER_CLOSE, VER_DONE, VER_NUM };
+
+static void
+verify_run (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceBcm5880Cv2 *self = FPI_DEVICE_BCM5880CV2 (dev);
+  fp_dbg ("verify SSM state %d", fpi_ssm_get_cur_state (ssm));
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case VER_OPEN:
+      cv_enc (dev, 0x02, 0x0440, BODY_02, sizeof BODY_02, FALSE);
+      break;
+    case VER_ARM:
+      {
+        /* object handle came back in the 0x02 response */
+        if (self->resp_len < 12) { fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_PROTO)); return; }
+        memcpy (self->obj_handle, self->resp + 8, 4);
+        /* 0x73 arms the verify capture (like 0x8a arms the enroll capture); result ignored */
+        gsize n; guint8 *b = build_73 (self->obj_handle, &n);
+        cv_enc (dev, 0x73, 0x0442, b, n, TRUE);
+        g_free (b);
+      }
+      break;
+    case VER_CAPTURE:
+      {
+        /* poll the capture until a finger is present */
+        gsize n; guint8 *b = build_66 (self->obj_handle, &n);
+        cv_enc (dev, 0x66, 0x0442, b, n, TRUE);
+        g_free (b);
+      }
+      break;
+    case VER_SUBMIT:
+      {
+        guint8 *r = self->resp; gsize rl = self->resp_len;
+        if (rl < 28)                                  /* no finger yet -> keep polling */
+          {
+            if (++self->poll_count > VER_MAX_POLLS)
+              { fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL, "no finger (timeout)")); return; }
+            fpi_ssm_jump_to_state (ssm, VER_CAPTURE);
+            return;
+          }
+        memcpy (self->digest, r + 8, 20);
+        fp_warn ("verify: captured finger %02x%02x%02x%02x…", self->digest[0], self->digest[1], self->digest[2], self->digest[3]);
+        /* match the just-captured finger against the stored templates */
+        gsize n; guint8 *b = build_73 (self->obj_handle, &n);
+        cv_enc (dev, 0x73, 0x0442, b, n, TRUE);
+        g_free (b);
+      }
+      break;
+    case VER_CHECK:
+      fp_warn ("verify: 0x73 result +0x14 = 0x%x", self->result_code);
+      self->verify_matched = (self->result_code == 0);
+      fp_warn ("verify: %s", self->verify_matched ? "MATCH ✓" : "no match");
+      fpi_ssm_jump_to_state (ssm, VER_CLOSE);
+      break;
+    case VER_CLOSE:
+      {
+        guint8 body[12]; tlv_put (body, self->obj_handle, 4);
+        cv_enc (dev, 0x04, 0x0040, body, sizeof body, FALSE);
+      }
+      break;
+    case VER_DONE:
+      fpi_ssm_mark_completed (ssm);
+      break;
+    }
+}
+
+static void
+verify_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpiDeviceBcm5880Cv2 *self = FPI_DEVICE_BCM5880CV2 (dev);
+  fp_warn ("verify_done: %s", error ? error->message : (self->verify_matched ? "MATCH" : "no match"));
+  if (error) { fpi_device_verify_complete (dev, error); return; }
+
+  FpPrint *print = NULL;
+  fpi_device_get_verify_data (dev, &print);
+  fpi_device_verify_report (dev,
+                            self->verify_matched ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
+                            self->verify_matched ? print : NULL, NULL);
+  fpi_device_verify_complete (dev, NULL);
+}
+
+/* verify needs a FRESH secure session (the chip won't re-open an object in the session
+ * that was just used for an enroll) — matching the Windows flow, which re-handshakes
+ * before every verify. So run the open handshake SSM first, then the verify SSM. */
+static void
+vhs_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpiDeviceBcm5880Cv2 *self = FPI_DEVICE_BCM5880CV2 (dev);
+  if (error) { fp_warn ("verify handshake failed: %s", error->message); fpi_device_verify_complete (dev, error); return; }
+  self->poll_count = 0;
+  self->verify_matched = FALSE;
+  self->task_ssm = fpi_ssm_new (dev, verify_run, VER_NUM);
+  fpi_ssm_start (self->task_ssm, verify_done);
+}
+
+static void
+dev_verify (FpDevice *dev)
+{
+  FpiDeviceBcm5880Cv2 *self = FPI_DEVICE_BCM5880CV2 (dev);
+  self->task_ssm = fpi_ssm_new (dev, open_run, OPEN_NUM);
+  fpi_ssm_start (self->task_ssm, vhs_done);
+}
 
 static void
 fpi_device_bcm5880cv2_init (FpiDeviceBcm5880Cv2 *self) {}
