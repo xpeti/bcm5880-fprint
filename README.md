@@ -31,17 +31,26 @@ reproduces its cryptography.
 | Decrypt a real Windows session end-to-end | ✅ `decrypt.py` |
 | **Native `libfprint` TOD driver — secure session end-to-end** | ✅ **`driver/` — loads in `fprintd`, binds the device, runs the full handshake (`0x39`→`0x82`→`0x23`→`0x24`), chip accepts the RSA key transport, session derived; chip healthy** |
 | **Native encrypted commands round-trip on the chip** | ✅ **wrapped `0x02` open-object + `0x04` close verified: chip replies decrypt to valid data (object handle); requires reading the chip modulus little-endian** |
-| **Enroll on the chip → encrypted commit (`0x6e`)** | ✅ **works end-to-end: 8-stage capture loop + the encrypted commit the CV3 driver never could do — template stored, chip healthy** |
-| Verify / identify (match-on-chip) | 🚧 next |
+| **Full CV2 command set reverse-engineered** | ✅ **open `0x02`, discard `0x6d`, begin `0x8a`, capture `0x66`, submit `0x6c`, end `0x68`, commit `0x6e`, identify `0x73`, close `0x04`, chipinfo `0x39`, setup `0x82` — from the CV3 `broadcom.so` disassembly + the plaintext enroll capture** |
+| **Enroll on the chip, end-to-end** | ✅ **host-assisted capture loop → chip signals `0x59` COMPLETE → encrypted commit `0x6e` returns `0x8d`, byte-for-byte identical to the real CV3 driver. The encrypted commit the CV3 driver never could do.** |
+| Verify / identify (match-on-chip) | 🚧 **pipeline runs end-to-end (fresh handshake → `0x73` arm → `0x66` capture → `0x73` match); chip captures & compares but does not yet report a match — final piece** |
 | `libfprint` driver build | ✅ `driver/Makefile` |
 
-**The hard part is done:** the ControlVault 2 "secure session" cryptography — the
+**The hard part is done.** The ControlVault 2 "secure session" cryptography — the
 exact reason the device couldn't be driven on Linux — has been completely reverse
-engineered and **verified byte-for-byte offline**, and a native `libfprint` TOD
-driver (`driver/`) now establishes that session on the real chip end-to-end: it
-loads in `fprintd`, runs the full handshake, and the chip **accepts** the RSA key
-transport. What remains is mechanical: wrap the (already known, plaintext-captured)
-enroll/commit commands in this session crypto and report progress through `libfprint`.
+engineered and **verified byte-for-byte offline**, and the native `libfprint` TOD
+driver (`driver/`) now drives the chip through a **complete fingerprint enrollment on
+the real hardware**: it loads in `fprintd`, runs the full handshake, opens an object,
+runs the host-assisted capture loop until the chip reports the enrollment **COMPLETE
+(`0x59`)**, and sends the **encrypted commit (`0x6e`)** — which the chip accepts with
+the exact `0x8d` result the original Windows/CV3 driver produces. That encrypted
+commit is the thing the CV3 driver fundamentally *cannot* do, and it works here.
+
+What remains is the **match** side: the verify pipeline runs end-to-end (the chip
+captures the finger and compares), but does not yet report a match. The command flow
+and parameters are confirmed identical to the CV3 driver's `cvif_fingerprint_identify`;
+the last gap is being closed with a decryptable reference capture of a real
+enroll+verify.
 
 ---
 
@@ -225,13 +234,15 @@ sudo ./probe
 
 ## Remaining work (contributions welcome)
 
-1. Add the session to `probe.c`: build the `0x24` key transport, derive the keys,
-   and wrap/unwrap commands (AES-128-CBC + HMAC-SHA1 + counter) using OpenSSL.
-2. Validate each produced frame **offline** against `captures/` (byte-exact) before
-   ever sending it — then a single confident run on the chip.
-3. Replay the (now-encrypted) enroll cycle + commit `0x6e` so the template is stored,
-   then identify/verify (match-on-chip).
-4. Wrap it as a `libfprint` driver.
+1. **Make verify match.** Enroll + encrypted commit (`0x6e` → `0x8d`) already store a
+   template on the chip, and the identify flow (`0x73`) is byte-identical to the CV3
+   driver's — yet the chip reports no match. The remaining unknown is isolated to how
+   a committed template becomes matchable; the plan is to decrypt a real
+   enroll+verify reference (deterministic-nonce capture) and diff it against ours.
+2. Polish enroll completion (the chip signals COMPLETE with `0x59`, or `0x8c`
+   "enrollment full" after ~4 samples on this firmware) and surface progress/retries
+   cleanly through `fprintd`.
+3. Package the driver (install path, udev/polkit notes) once verify matches.
 
 ⚠️ **Chip fragility:** always open exactly one session and close it (`0x04` + handle);
 never hammer the device with speculative commands. A wrong secure-session command can
