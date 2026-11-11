@@ -33,7 +33,8 @@ struct _FpiDeviceBcm5880Cv2
   guint32     result_code;    /* response header +0x14 field: verify match result (0=match, 0x89=no finger, 0x85=no match) */
   /* enroll bookkeeping */
   guint8      obj_handle[4];  /* object-session handle from the 0x02 response body */
-  guint       enroll_stage;   /* completed capture cycles */
+  guint       enroll_stage;   /* accepted enrollment samples (0x6c +0x14==0) */
+  guint       submits;        /* total 0x6c submits (loop cap) */
   guint       poll_count;     /* 0x66 polls waiting for the current finger press */
   guint8      digest[20];     /* last 0x66 image digest */
   FpPrint    *enroll_print;
@@ -78,6 +79,15 @@ cv_drain_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError
   fpi_ssm_mark_completed (transfer->ssm);
 }
 
+/* completion for draining an async event's body (st=3, len>0): discard it and re-read
+ * the real command status. */
+static void
+cv_evt_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
+{
+  if (error) g_error_free (error);
+  fpi_ssm_jump_to_state (transfer->ssm, CV_STATUS);
+}
+
 static void
 cv_ssm_run (FpiSsm *ssm, FpDevice *dev)
 {
@@ -104,12 +114,17 @@ cv_ssm_run (FpiSsm *ssm, FpDevice *dev)
         memcpy (&st,  self->status + 0, 4); st  = GUINT32_FROM_LE (st);
         memcpy (&len, self->status + 4, 4); len = GUINT32_FROM_LE (len);
         fp_dbg ("cv status=0x%x len=%u enc=%d", st, len, self->enc);
-        /* 0x85 carries both command results AND async finger events (st=3, len=0). A late
-         * event can arrive on this channel just before a command's real status; skip it
-         * and re-read rather than treating it as a protocol error. */
-        if (st == 3 && len == 0)
+        /* 0x85 carries both command results AND async finger events (st=3; len=0, or len>0
+         * with a small payload on EP_IN). A late event can arrive on this channel just
+         * before a command's real status; drain it and re-read rather than erroring. */
+        if (st == 3 && self->status_skips++ < 64)
           {
-            if (self->status_skips++ < 64) { fpi_ssm_jump_to_state (ssm, CV_STATUS); return; }
+            if (len == 0) { fpi_ssm_jump_to_state (ssm, CV_STATUS); return; }
+            t = fpi_usb_transfer_new (dev);        /* discard the event body, then re-status */
+            fpi_usb_transfer_fill_bulk (t, EP_IN, len);
+            t->ssm = ssm;
+            fpi_usb_transfer_submit (t, CV_TIMEOUT, NULL, cv_evt_cb, NULL);
+            return;
           }
         if (st != 0)
           {
@@ -232,6 +247,9 @@ open_run (FpiSsm *ssm, FpDevice *dev)
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case OPEN_39:
+      /* the handshake is always plaintext; clear enc/drain left over from a prior op
+       * (e.g. a verify re-handshake after an enroll) so responses aren't mis-unwrapped */
+      self->enc = FALSE; self->drain_extra = FALSE;
       cv_cmd (dev, g_memdup2 (CMD39, sizeof CMD39), sizeof CMD39);
       break;
     case OPEN_82:
@@ -315,6 +333,8 @@ dev_close (FpDevice *device)
 #define EN_COMMIT_ENABLED 1
 #define EN_MAX_STAGES      8
 #define EN_MAX_POLLS       40   /* ~1.5 s each -> ~60 s to present a finger per stage */
+#define EN_MAX_SUBMITS     40   /* cap total 0x6c submits while waiting for the 0x59 complete */
+#define EN_COMMIT_SAMPLES  12   /* safety fallback only; a healthy chip signals 0x59 first (~5 samples) */
 
 /* 0x02 open-object body (CV2): {tag0 len4 = 0x4d} {tag1 len0}x3. The response carries the
  * object handle (= session handle). */
@@ -351,7 +371,7 @@ build_6c (const guint8 handle[4], const guint8 digest[20], gsize *len)
   *len = 48; return b;
 }
 
-enum { EN_OPEN, EN_BEGIN, EN_POLL, EN_SUBMIT, EN_END, EN_COMMIT, EN_CLOSE, EN_DONE, EN_NUM };
+enum { EN_OPEN, EN_DISCARD, EN_BEGIN, EN_POLL, EN_SUBMIT, EN_END, EN_COMMIT, EN_CLOSE, EN_DONE, EN_NUM };
 
 static void
 enroll_run (FpiSsm *ssm, FpDevice *dev)
@@ -363,15 +383,22 @@ enroll_run (FpiSsm *ssm, FpDevice *dev)
     case EN_OPEN:
       cv_enc (dev, 0x02, 0x0440, BODY_02, sizeof BODY_02, FALSE);
       break;
-    case EN_BEGIN:
+    case EN_DISCARD:
       {
+        /* object handle came back in the 0x02 response */
         guint8 *r = self->resp; gsize rl = self->resp_len;
         if (rl < 12) { fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_PROTO)); return; }
         memcpy (self->obj_handle, r + 8, 4);
         fp_warn ("enroll: object handle = %02x%02x%02x%02x",
                  self->obj_handle[0], self->obj_handle[1], self->obj_handle[2], self->obj_handle[3]);
-        cv_enc (dev, 0x8a, 0x0440, BODY_8A68, sizeof BODY_8A68, FALSE);
+        /* discard any stale/dangling enrollment left by a prior aborted enroll, so the
+         * chip accepts fresh samples (otherwise every 0x6c comes back 0x8c) */
+        guint8 body[12]; tlv_put (body, self->obj_handle, 4);
+        cv_enc (dev, 0x6d, 0x0440, body, sizeof body, FALSE);
       }
+      break;
+    case EN_BEGIN:
+      cv_enc (dev, 0x8a, 0x0440, BODY_8A68, sizeof BODY_8A68, FALSE);
       break;
     case EN_POLL:
       {
@@ -406,13 +433,37 @@ enroll_run (FpiSsm *ssm, FpDevice *dev)
       break;
     case EN_END:
       {
-        /* 0x6c submit done; report progress. Loop until EN_MAX_STAGES, then finish. */
-        self->enroll_stage++;
-        fp_warn ("enroll: stage %u/%u complete (0x6c resp %zu B)", self->enroll_stage, EN_MAX_STAGES, self->resp_len);
-        fpi_device_enroll_progress (dev, self->enroll_stage, NULL, NULL);
-        if (self->enroll_stage < EN_MAX_STAGES)
-          { fpi_ssm_jump_to_state (ssm, EN_POLL); return; }
-        cv_enc (dev, 0x68, 0x0440, BODY_8A68, sizeof BODY_8A68, FALSE);
+        /* 0x6c submit done. The chip signals enrollment state in the response +0x14:
+         *   0x59 = enrollment COMPLETE (enough samples) -> end + commit
+         *   0x00 = this sample accepted -> count it, capture the next
+         *   else (0x89/0x8c/…) = sample not accepted (retry) -> capture again, no progress */
+        self->submits++;
+        guint32 rc = self->result_code;
+        fp_warn ("enroll: 0x6c +0x14=0x%x (accepted=%u submits=%u)", rc, self->enroll_stage, self->submits);
+        if (rc == 0x59)
+          {
+            fp_warn ("enroll: chip reports COMPLETE");
+            fpi_device_enroll_progress (dev, EN_MAX_STAGES, NULL, NULL);
+            cv_enc (dev, 0x68, 0x0440, BODY_8A68, sizeof BODY_8A68, FALSE);
+            break;
+          }
+        if (rc == 0)
+          {
+            self->enroll_stage++;
+            fpi_device_enroll_progress (dev, MIN (self->enroll_stage, EN_MAX_STAGES), NULL, NULL);
+            /* fallback: if the chip accepts samples but never signals 0x59 (seen on a chip
+             * degraded by heavy testing), commit once we have enough accepted samples */
+            if (self->enroll_stage >= EN_COMMIT_SAMPLES)
+              {
+                fp_warn ("enroll: %u accepted samples -> committing (no 0x59)", self->enroll_stage);
+                fpi_device_enroll_progress (dev, EN_MAX_STAGES, NULL, NULL);
+                cv_enc (dev, 0x68, 0x0440, BODY_8A68, sizeof BODY_8A68, FALSE);
+                break;
+              }
+          }
+        if (self->submits > EN_MAX_SUBMITS)
+          { fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL, "enrollment did not complete")); return; }
+        fpi_ssm_jump_to_state (ssm, EN_POLL);
       }
       break;
     case EN_COMMIT:
@@ -420,7 +471,20 @@ enroll_run (FpiSsm *ssm, FpDevice *dev)
       {
         guint8 body[64]; guint8 *p = body;
         p = tlv_put (p, self->obj_handle, 4);                 /* {tag0 len4 handle} */
-        guint8 zero20[20] = {0}; p = tlv_put (p, zero20, 20); /* {tag0 len0x14 zeros} */
+        /* {tag0 len0x14 = 20-byte template ID}. The CV3 driver passes a non-zero id here
+         * (all other commit data params are zero); a zero id stores an unmatchable
+         * placeholder. Derive a stable id from the print's username. */
+        guint8 id[20] = { 0 };
+        const char *user = self->enroll_print ? fp_print_get_username (self->enroll_print) : NULL;
+        if (user)
+          {
+            gsize dl = sizeof id;
+            GChecksum *ck = g_checksum_new (G_CHECKSUM_SHA1);
+            g_checksum_update (ck, (const guchar *) user, -1);
+            g_checksum_get_digest (ck, id, &dl);
+            g_checksum_free (ck);
+          }
+        p = tlv_put (p, id, 20);
         /* trailing fields verbatim from the capture: {tag2 len0}{tag2 len0}{tag3 len0} */
         static const guint8 tail[24] = { 2,0,0,0, 0,0,0,0,  2,0,0,0, 0,0,0,0,  3,0,0,0, 0,0,0,0 };
         memcpy (p, tail, 24); p += 24;
@@ -469,6 +533,7 @@ dev_enroll (FpDevice *dev)
   FpiDeviceBcm5880Cv2 *self = FPI_DEVICE_BCM5880CV2 (dev);
   fpi_device_get_enroll_data (dev, &self->enroll_print);
   self->enroll_stage = 0;
+  self->submits = 0;
   self->poll_count = 0;
   self->task_ssm = fpi_ssm_new (dev, enroll_run, EN_NUM);
   fpi_ssm_start (self->task_ssm, enroll_done);
