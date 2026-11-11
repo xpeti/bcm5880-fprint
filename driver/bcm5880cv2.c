@@ -37,8 +37,12 @@ struct _FpiDeviceBcm5880Cv2
   guint       submits;        /* total 0x6c submits (loop cap) */
   guint       poll_count;     /* 0x66 polls waiting for the current finger press */
   guint8      digest[20];     /* last 0x66 image digest */
+  guint8      sample[4][80];   /* accepted-sample data from 0x6c responses, for create_template */
+  gsize       sample_len[4];
+  guint       nsamples;
   FpPrint    *enroll_print;
   gboolean    verify_matched; /* verify verdict latched before closing the object */
+  guint8      verify_hash[20]; /* SHA1(username) template id passed to the 0x73 identify */
 };
 G_DECLARE_FINAL_TYPE (FpiDeviceBcm5880Cv2, fpi_device_bcm5880cv2, FPI, DEVICE_BCM5880CV2, FpDevice)
 G_DEFINE_TYPE (FpiDeviceBcm5880Cv2, fpi_device_bcm5880cv2, FP_TYPE_DEVICE)
@@ -371,7 +375,7 @@ build_6c (const guint8 handle[4], const guint8 digest[20], gsize *len)
   *len = 48; return b;
 }
 
-enum { EN_OPEN, EN_DISCARD, EN_BEGIN, EN_POLL, EN_SUBMIT, EN_END, EN_COMMIT, EN_CLOSE, EN_DONE, EN_NUM };
+enum { EN_OPEN, EN_DISCARD, EN_BEGIN, EN_POLL, EN_SUBMIT, EN_END, EN_CREATE, EN_COMMIT, EN_CLOSE, EN_DONE, EN_NUM };
 
 static void
 enroll_run (FpiSsm *ssm, FpDevice *dev)
@@ -449,6 +453,14 @@ enroll_run (FpiSsm *ssm, FpDevice *dev)
           }
         if (rc == 0)
           {
+            /* accepted sample: stash the 0x6c response data for create_template (0x6f) */
+            if (self->nsamples < 4 && self->resp_len > 0 && self->resp_len <= sizeof self->sample[0])
+              {
+                memcpy (self->sample[self->nsamples], self->resp, self->resp_len);
+                self->sample_len[self->nsamples] = self->resp_len;
+                self->nsamples++;
+                fp_warn ("enroll: stashed sample %u (%zu B)", self->nsamples, self->resp_len);
+              }
             self->enroll_stage++;
             fpi_device_enroll_progress (dev, MIN (self->enroll_stage, EN_MAX_STAGES), NULL, NULL);
             /* fallback: if the chip accepts samples but never signals 0x59 (seen on a chip
@@ -466,9 +478,27 @@ enroll_run (FpiSsm *ssm, FpDevice *dev)
         fpi_ssm_jump_to_state (ssm, EN_POLL);
       }
       break;
+    case EN_CREATE:
+      {
+        /* 0x6f create_template: builds the storable template from the accepted samples.
+         * Body = {tag0 handle} + 4x {tag2 = accepted-sample data from the 0x6c responses}. */
+        guint8 body[512]; guint8 *p = body;
+        p = tlv_put (p, self->obj_handle, 4);
+        for (int i = 0; i < 4; i++)
+          {
+            guint32 t = GUINT32_TO_LE (2); memcpy (p, &t, 4); p += 4;
+            gsize l = (guint) i < self->nsamples ? self->sample_len[i] : 0;
+            guint32 lv = GUINT32_TO_LE (l); memcpy (p, &lv, 4); p += 4;
+            if (l) { memcpy (p, self->sample[i], l); p += l; }
+          }
+        fp_warn ("enroll: 0x6f create_template with %u samples (%ld B)", self->nsamples, (long) (p - body));
+        cv_enc (dev, 0x6f, 0x0440, body, p - body, FALSE);
+      }
+      break;
     case EN_COMMIT:
 #if EN_COMMIT_ENABLED
       {
+        fp_warn ("enroll: 0x6f create_template result +0x14=0x%x", self->result_code);
         guint8 body[64]; guint8 *p = body;
         p = tlv_put (p, self->obj_handle, 4);                 /* {tag0 len4 handle} */
         /* {tag0 len0x14 = 20-byte template ID}. The CV3 driver passes a non-zero id here
@@ -497,6 +527,7 @@ enroll_run (FpiSsm *ssm, FpDevice *dev)
 #endif
     case EN_CLOSE:
       {
+        fp_warn ("enroll: 0x6e commit result +0x14=0x%x", self->result_code);
         guint8 body[12]; tlv_put (body, self->obj_handle, 4);
         cv_enc (dev, 0x04, 0x0040, body, sizeof body, FALSE);
       }
@@ -534,6 +565,7 @@ dev_enroll (FpDevice *dev)
   fpi_device_get_enroll_data (dev, &self->enroll_print);
   self->enroll_stage = 0;
   self->submits = 0;
+  self->nsamples = 0;
   self->poll_count = 0;
   self->task_ssm = fpi_ssm_new (dev, enroll_run, EN_NUM);
   fpi_ssm_start (self->task_ssm, enroll_done);
@@ -549,18 +581,22 @@ dev_enroll (FpDevice *dev)
 #define VER_MAX_POLLS 40
 
 static guint8 *
-build_73 (const guint8 handle[4], gsize *len)
+build_73 (const guint8 handle[4], const guint8 *hash, gsize *len)
 {
-  guint8 *b = g_malloc0 (68); guint8 *p = b;
+  /* identify body: {tag0 handle}{tag0 0x48}{tag0 0x53e2}{tag0 0}{tag2 len4=0}{tag3 = hash}
+   * the tag3 is the template id (SHA1 username) to match against (identify_w_hash). */
+  gsize hl = hash ? 20 : 0;
+  guint8 *b = g_malloc0 (68 + hl); guint8 *p = b;
   guint32 v;
   p = tlv_put (p, handle, 4);
   v = GUINT32_TO_LE (0x48);   p = tlv_put (p, &v, 4);
   v = GUINT32_TO_LE (0x53e2); p = tlv_put (p, &v, 4);
   v = GUINT32_TO_LE (0);      p = tlv_put (p, &v, 4);
-  /* {tag2 len4 = 0}{tag3 len0} */
   v = GUINT32_TO_LE (2); memcpy (p, &v, 4); p += 4; v = GUINT32_TO_LE (4); memcpy (p, &v, 4); p += 4; memset (p, 0, 4); p += 4;
-  v = GUINT32_TO_LE (3); memcpy (p, &v, 4); p += 4; memset (p, 0, 4); p += 4;
-  *len = 68; return b;
+  v = GUINT32_TO_LE (3); memcpy (p, &v, 4); p += 4;
+  v = GUINT32_TO_LE (hl); memcpy (p, &v, 4); p += 4;
+  if (hl) { memcpy (p, hash, hl); p += hl; }
+  *len = 68 + hl; return b;
 }
 
 enum { VER_OPEN, VER_ARM, VER_CAPTURE, VER_SUBMIT, VER_CHECK, VER_CLOSE, VER_DONE, VER_NUM };
@@ -581,7 +617,7 @@ verify_run (FpiSsm *ssm, FpDevice *dev)
         if (self->resp_len < 12) { fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_PROTO)); return; }
         memcpy (self->obj_handle, self->resp + 8, 4);
         /* 0x73 arms the verify capture (like 0x8a arms the enroll capture); result ignored */
-        gsize n; guint8 *b = build_73 (self->obj_handle, &n);
+        gsize n; guint8 *b = build_73 (self->obj_handle, NULL, &n);
         cv_enc (dev, 0x73, 0x0442, b, n, TRUE);
         g_free (b);
       }
@@ -607,7 +643,7 @@ verify_run (FpiSsm *ssm, FpDevice *dev)
         memcpy (self->digest, r + 8, 20);
         fp_warn ("verify: captured finger %02x%02x%02x%02x…", self->digest[0], self->digest[1], self->digest[2], self->digest[3]);
         /* match the just-captured finger against the stored templates */
-        gsize n; guint8 *b = build_73 (self->obj_handle, &n);
+        gsize n; guint8 *b = build_73 (self->obj_handle, NULL, &n);
         cv_enc (dev, 0x73, 0x0442, b, n, TRUE);
         g_free (b);
       }
@@ -663,6 +699,20 @@ static void
 dev_verify (FpDevice *dev)
 {
   FpiDeviceBcm5880Cv2 *self = FPI_DEVICE_BCM5880CV2 (dev);
+  /* template id to match against = SHA1(username) of the print being verified
+   * (same id the enroll commit stored the template under) */
+  memset (self->verify_hash, 0, sizeof self->verify_hash);
+  FpPrint *print = NULL;
+  fpi_device_get_verify_data (dev, &print);
+  const char *user = print ? fp_print_get_username (print) : NULL;
+  if (user)
+    {
+      gsize dl = sizeof self->verify_hash;
+      GChecksum *ck = g_checksum_new (G_CHECKSUM_SHA1);
+      g_checksum_update (ck, (const guchar *) user, -1);
+      g_checksum_get_digest (ck, self->verify_hash, &dl);
+      g_checksum_free (ck);
+    }
   self->task_ssm = fpi_ssm_new (dev, open_run, OPEN_NUM);
   fpi_ssm_start (self->task_ssm, vhs_done);
 }
