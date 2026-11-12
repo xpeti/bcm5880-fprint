@@ -681,9 +681,14 @@ enroll_done (FpiSsm *ssm, FpDevice *dev, GError *error)
     fpi_device_enroll_complete (dev, NULL, error);
   else
     {
-      /* match-on-chip: the template lives on the device; keep a reference print */
+      /* match-on-chip: the template lives on the device; keep a reference print. MUST set
+       * "fpi-data" (a GVariant) — a device-stored FPI_PRINT_RAW print still serialises
+       * g_variant_new_variant(print->data), which SEGFAULTs if data is NULL (fprintd stores the
+       * print to disk after enroll). Store the chip template-id as the fpi-data (like elanmoc). */
       fpi_print_set_type (self->enroll_print, FPI_PRINT_RAW);
       fpi_print_set_device_stored (self->enroll_print, TRUE);
+      GVariant *fpi_data = g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, self->template_id, 20, 1);
+      g_object_set (self->enroll_print, "fpi-data", fpi_data, NULL);
       fpi_device_enroll_complete (dev, g_object_ref (self->enroll_print), NULL);
     }
 }
@@ -845,7 +850,7 @@ verify_run (FpiSsm *ssm, FpDevice *dev)
         g_string_free (h, TRUE);
         if (verdict == 1)
           { self->verify_matched = TRUE; fp_warn ("verify: MATCH ✓"); fpi_ssm_jump_to_state (ssm, VER_CLOSE); break; }
-        if (self->submits++ >= 6)
+        if (self->submits++ >= 14)
           { self->verify_matched = FALSE; fp_warn ("verify: no match (rounds exhausted)"); fpi_ssm_jump_to_state (ssm, VER_CLOSE); break; }
         fpi_ssm_jump_to_state (ssm, VER_CAPTURE);                   /* next capture→identify round */
       }
