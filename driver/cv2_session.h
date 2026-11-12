@@ -17,6 +17,8 @@ typedef struct {
     uint8_t  hmac_key[20];    /* HMAC-SHA1 key = SHA1("CV secure session blob\0") */
     uint8_t  handle[4];       /* session handle from the 0x23 response */
     uint32_t counter;         /* per-session command index, starts 0 */
+    uint8_t  key2[16];        /* ECDH-bound "sealed channel" AES key (Key 2) */
+    int      use_key2;        /* if set, encrypt/decrypt commands with key2 instead of enc_key */
 } cv2_session;
 
 /* Derive ENC key from the 20-byte chip nonce (tail of the 0x23 response param)

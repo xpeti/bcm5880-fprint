@@ -23,6 +23,16 @@ void cv2_session_init(cv2_session *s, const uint8_t chip_nonce[20],
     SHA1((const uint8_t *)"CV secure session blob\0", 23, s->hmac_key);
     memcpy(s->handle, handle, 4);
     s->counter = 0;
+    /* TEST (option C): the sealed/bound channel encrypts feature commands with an
+     * ECDH-derived "Key 2" instead of the RSA-session key. Features over Key 2 are
+     * what make the stored template MATCHABLE. Here we reuse the dumped Windows
+     * Key 2 (from the live WbioSrvc memory) to test whether the chip's existing
+     * bind applies to our session. */
+    /* NO Key 2: the whole CV2 enroll (incl. feature cmds) uses Key 1 — proven by
+     * decrypting a confirmed-hooked Windows enroll (20/20 feature cmds matched Key 1).
+     * The earlier "sealed-feature Key 2" theory was wrong. Always Key 1. */
+    memset(s->key2, 0, 16);
+    s->use_key2 = 0;
 }
 
 int cv2_build_rsa_block(const uint8_t modulus[256], const uint8_t host_nonce[20],
@@ -82,7 +92,7 @@ int cv2_wrap(cv2_session *s, uint16_t cmdid, uint16_t driver_flags,
     memset(pt + p, 0, 8); p += 8;
     for (int i = 0; i < pad; i++) pt[p++] = pad;
     EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new(); int ol = 0, fl = 0;
-    EVP_EncryptInit_ex(c, EVP_aes_128_cbc(), NULL, s->enc_key, iv);
+    EVP_EncryptInit_ex(c, EVP_aes_128_cbc(), NULL, s->use_key2 ? s->key2 : s->enc_key, iv);
     EVP_CIPHER_CTX_set_padding(c, 0);
     EVP_EncryptUpdate(c, out + 0x2c, &ol, pt, ctlen);
     EVP_EncryptFinal_ex(c, out + 0x2c + ol, &fl);
@@ -100,7 +110,7 @@ int cv2_unwrap(const cv2_session *s, const uint8_t *frame, int framelen,
     if (bodylen > bodycap) return -1;
     uint8_t pt[4096];
     EVP_CIPHER_CTX *d = EVP_CIPHER_CTX_new(); int dl = 0, dfl = 0;
-    EVP_DecryptInit_ex(d, EVP_aes_128_cbc(), NULL, s->enc_key, iv);
+    EVP_DecryptInit_ex(d, EVP_aes_128_cbc(), NULL, s->use_key2 ? s->key2 : s->enc_key, iv);
     EVP_CIPHER_CTX_set_padding(d, 0);
     EVP_DecryptUpdate(d, pt, &dl, frame + 0x2c, framelen - 0x2c);
     EVP_DecryptFinal_ex(d, pt + dl, &dfl);

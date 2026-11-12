@@ -37,13 +37,42 @@ struct _FpiDeviceBcm5880Cv2
   guint       submits;        /* total 0x6c submits (loop cap) */
   guint       poll_count;     /* 0x66 polls waiting for the current finger press */
   guint8      digest[20];     /* last 0x66 image digest */
+  guint8      template_id[20];/* chip-assigned template id from the final 0x6c resp (echoed in 0x6e commit) */
+  gboolean    have_tid;       /* template_id populated */
   guint8      sample[4][80];   /* accepted-sample data from 0x6c responses, for create_template */
   gsize       sample_len[4];
   guint       nsamples;
   FpPrint    *enroll_print;
   gboolean    verify_matched; /* verify verdict latched before closing the object */
   guint8      verify_hash[20]; /* SHA1(username) template id passed to the 0x73 identify */
+  guint8      feature_ref[20]; /* per-template feature-ref: enroll tags the template with it in the
+                                * commit-open {tag1 len20}, verify replays it to LOAD the template.
+                                * Windows stores a bipdll value here; we use SHA1(username) so enroll
+                                * and verify agree deterministically with no host-side storage. */
+  guint8      tmpl_handle[4];  /* handle of the feature-ref-loaded template object (verify) */
+  guint8      probe_id[20];    /* probe-id from the verify probe mini-enroll (0x6c prefix-flip) */
+  gboolean    have_probe;      /* probe_id populated */
+  guint8      scratch_cur[4];  /* scratch feature-slot opened THIS probe iteration */
+  guint8      scratch_prev[4]; /* scratch slot from the PREVIOUS iteration (closed with a 1-iter lag) */
 };
+/* fixed 16-byte feature-set container id that precedes the feature-ref in the enroll commit-open
+ * AND the verify template-load open — CONSTANT across all Windows enrolls/captures/days. */
+static const guint8 FEATURE_CONTAINER[16] = {
+  0xba,0x97,0x8e,0x77,0xaa,0xb6,0xce,0x4b,0x8b,0xe5,0x8b,0xda,0x18,0x2d,0x3e,0xcf };
+/* fixed probe-slot reference the chip uses for the live captured probe in 0x73 identify (tag2) */
+#define PROBE_REF 0x0010d1e8
+static void
+compute_feature_ref (FpPrint *print, guint8 out[20])
+{
+  memset (out, 0, 20);
+  const char *user = print ? fp_print_get_username (print) : NULL;
+  if (!user) user = "cv2user";
+  gsize dl = 20;
+  GChecksum *ck = g_checksum_new (G_CHECKSUM_SHA1);
+  g_checksum_update (ck, (const guchar *) user, -1);
+  g_checksum_get_digest (ck, out, &dl);
+  g_checksum_free (ck);
+}
 G_DECLARE_FINAL_TYPE (FpiDeviceBcm5880Cv2, fpi_device_bcm5880cv2, FPI, DEVICE_BCM5880CV2, FpDevice)
 G_DEFINE_TYPE (FpiDeviceBcm5880Cv2, fpi_device_bcm5880cv2, FP_TYPE_DEVICE)
 
@@ -338,7 +367,10 @@ dev_close (FpDevice *device)
 #define EN_MAX_STAGES      8
 #define EN_MAX_POLLS       40   /* ~1.5 s each -> ~60 s to present a finger per stage */
 #define EN_MAX_SUBMITS     40   /* cap total 0x6c submits while waiting for the 0x59 complete */
-#define EN_COMMIT_SAMPLES  24   /* last-resort safety only. This chip's firmware accepts ~4 samples
+#define EN_COMMIT_SAMPLES  99   /* DISABLED premature-commit. Only 0x59 (COMPLETE) yields a matchable
+                                 * template + 0x8d commit; committing on an accept-count or on 0x8c gives
+                                 * 0x8e (bad template). 0x59 requires DIVERSE finger coverage.
+                                 * (old) last-resort safety only. This chip's firmware accepts ~4 samples
                                  * then signals "enrollment full" with 0x8c (not 0x59); the 0x8c
                                  * handler below is the real completion trigger. Committing on the
                                  * raw accept count (before the chip signals done) finalises an
@@ -358,14 +390,17 @@ static const guint8 BODY_8A68[] = {
   0x00,0x00,0x00,0x00, 0x04,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
 };
 
-/* 0x66 capture-poll body (CV2): {tag0 len4 = obj_handle}{tag0 len4 = 1}{tag0 len4 = 0x23}. */
+/* 0x66 capture-poll body (CV2): {tag0 len4 = obj_handle}{tag0 len4 = 1}{tag0 len4 = mode}.
+ * The capture mode differs by purpose (cv_fingerprint_capture_start sends 0x66 with this
+ * field): 0x23 for enrollment, 0x48 for verify/identify. Capturing a verify probe in the
+ * enroll mode yields a feature the matcher can't compare against the template -> no match. */
 static guint8 *
-build_66 (const guint8 handle[4], gsize *len)
+build_66 (const guint8 handle[4], guint32 mode, gsize *len)
 {
   guint8 *b = g_malloc0 (36); guint8 *p = b;
   p = tlv_put (p, handle, 4);
   guint32 one = GUINT32_TO_LE (1);     p = tlv_put (p, &one, 4);
-  guint32 k23 = GUINT32_TO_LE (0x23);  p = tlv_put (p, &k23, 4);
+  guint32 m   = GUINT32_TO_LE (mode);  p = tlv_put (p, &m, 4);
   *len = 36; return b;
 }
 /* 0x6c submit-sample body: {tag0 len4 = obj_handle}{tag0 len0x14 = digest}{tag2 len0}. */
@@ -380,7 +415,7 @@ build_6c (const guint8 handle[4], const guint8 digest[20], gsize *len)
   *len = 48; return b;
 }
 
-enum { EN_OPEN, EN_DISCARD, EN_BEGIN, EN_POLL, EN_SUBMIT, EN_END, EN_CREATE, EN_COMMIT, EN_CLOSE, EN_DONE, EN_NUM };
+enum { EN_RESET, EN_OPEN, EN_DISCARD, EN_BEGIN, EN_POLL, EN_SUBMIT, EN_END, EN_CREATE, EN_COMMIT, EN_CLOSE, EN_DONE, EN_NUM };
 
 static void
 enroll_run (FpiSsm *ssm, FpDevice *dev)
@@ -389,7 +424,19 @@ enroll_run (FpiSsm *ssm, FpDevice *dev)
   fp_dbg ("enroll SSM state %d (stage %u)", fpi_ssm_get_cur_state (ssm), self->enroll_stage);
   switch (fpi_ssm_get_cur_state (ssm))
     {
+    case EN_RESET:
+      {
+        /* cv_fingerprint_reset (opcode 0x5d, from broadcom.so cv_fingerprint_reset @0x27160:
+         * push 0x5d -> cvhManageCVAPICall; body = {tag0 len4 = 0}). Resets the chip's fingerprint
+         * subsystem — clears the stuck enrollment state that stops it finalizing a template after
+         * heavy use. Not in any Windows capture (a recovery command, not used in normal flow). */
+        fp_warn ("enroll: CV fingerprint reset (0x5d)");
+        guint32 z = 0; guint8 body[12]; tlv_put (body, &z, 4);
+        cv_enc (dev, 0x5d, 0x0440, body, sizeof body, FALSE);
+      }
+      break;
     case EN_OPEN:
+      fp_warn ("enroll: 0x5d reset result +0x14=0x%x", self->result_code);
       cv_enc (dev, 0x02, 0x0440, BODY_02, sizeof BODY_02, FALSE);
       break;
     case EN_DISCARD:
@@ -412,8 +459,8 @@ enroll_run (FpiSsm *ssm, FpDevice *dev)
     case EN_POLL:
       {
         /* blocks on the chip until a finger is present; returns a 20-byte image digest.
-         * The trailing async status event is drained (drain_extra=TRUE). */
-        gsize n; guint8 *b = build_66 (self->obj_handle, &n);
+         * The trailing async status event is drained (drain_extra=TRUE). Enroll mode = 0x23. */
+        gsize n; guint8 *b = build_66 (self->obj_handle, 0x23, &n);
         cv_enc (dev, 0x66, 0x0442, b, n, TRUE);
         g_free (b);
       }
@@ -432,6 +479,12 @@ enroll_run (FpiSsm *ssm, FpDevice *dev)
             return;
           }
         self->poll_count = 0;
+        {
+          GString *hx = g_string_new (NULL);
+          for (gsize i = 0; i < rl && i < 80; i++) g_string_append_printf (hx, "%02x", r[i]);
+          fp_warn ("RAW 0x66 resp (%zu B): %s", rl, hx->str);
+          g_string_free (hx, TRUE);
+        }
         memcpy (self->digest, r + 8, 20);
         fp_warn ("enroll stage %u: got digest %02x%02x%02x%02x…",
                  self->enroll_stage, self->digest[0], self->digest[1], self->digest[2], self->digest[3]);
@@ -449,21 +502,60 @@ enroll_run (FpiSsm *ssm, FpDevice *dev)
         self->submits++;
         guint32 rc = self->result_code;
         fp_warn ("enroll: 0x6c +0x14=0x%x (accepted=%u submits=%u)", rc, self->enroll_stage, self->submits);
-        if (rc == 0x59)
+        /* Dump the full decrypted 0x6c response + extract the chip-assigned template id.
+         * CV2 response = {tag0 len4 handle}{tag0 len20 digest}{tag0 len4 status}. On accepted
+         * samples the 20-byte field ECHOES the submitted digest; on COMPLETION the chip returns
+         * a NEW 20-byte value = the template id (handle prefix also flips 00->01). That id MUST be
+         * echoed back in the 0x6e commit, else the template is stored under the wrong key and
+         * verify can't find it (0x85). The driver used to commit a hardcoded stale id. */
+        {
+          GString *h = g_string_new (NULL);
+          for (gsize i = 0; i < self->resp_len && i < 64; i++) g_string_append_printf (h, "%02x", self->resp[i]);
+          fp_warn ("enroll: 0x6c resp(%zu)=%s", self->resp_len, h->str);
+          g_string_free (h, TRUE);
+          /* 2nd TLV 20-byte value at offset 20 if layout matches */
+          if (self->resp_len >= 40 && self->resp[16] == 0x14 && self->resp[17] == 0 &&
+              memcmp (self->resp + 20, self->digest, 20) != 0)
+            {
+              memcpy (self->template_id, self->resp + 20, 20);
+              self->have_tid = TRUE;
+              fp_warn ("enroll: template-id from chip = %02x%02x%02x%02x…%02x",
+                       self->template_id[0], self->template_id[1], self->template_id[2],
+                       self->template_id[3], self->template_id[19]);
+            }
+        }
+        /* COMPLETION: the real CV2 signal is the chip returning a template-id (handle prefix
+         * flips 00->01, 20-byte field = new id != submitted digest) — NOT the CV3 +0x14==0x59.
+         * Waiting for 0x59 overruns into 0x8c (buffer full) and fails. Complete as soon as the
+         * chip hands us the template-id. */
+        if (self->have_tid)
           {
-            fp_warn ("enroll: chip reports COMPLETE");
+            /* ONLY the chip's prefix-flip template-id means a real matchable template (1104-byte
+             * commit blob). Complete + commit. */
+            fp_warn ("enroll: COMPLETE with chip template-id");
             fpi_device_enroll_progress (dev, EN_MAX_STAGES, NULL, NULL);
             cv_enc (dev, 0x68, 0x0440, BODY_8A68, sizeof BODY_8A68, FALSE);
             break;
           }
-        if (rc == 0x8c && self->enroll_stage >= 3)
+        if (rc == 0x59)
           {
-            /* this chip signals "enrollment full" with 0x8c after ~4 accepted samples
-             * rather than 0x59; treat it as completion and finalise. */
-            fp_warn ("enroll: chip full (0x8c) after %u accepts -> COMPLETE", self->enroll_stage);
-            fpi_device_enroll_progress (dev, EN_MAX_STAGES, NULL, NULL);
-            cv_enc (dev, 0x68, 0x0440, BODY_8A68, sizeof BODY_8A68, FALSE);
-            break;
+            /* Windows NEVER stops at 0x59 — it keeps submitting (~10-20 samples) until the chip
+             * returns the prefix-flip template-id. Treat 0x59 as "keep going", not "done": count it
+             * as progress and continue capturing. (Stopping here committed empty/unmatchable
+             * templates — the whole no-match saga.) */
+            fp_warn ("enroll: 0x59 (continue sampling for template-id, like Windows)");
+            self->enroll_stage++;
+            fpi_device_enroll_progress (dev, MIN (self->enroll_stage, EN_MAX_STAGES), NULL, NULL);
+          }
+        if (rc == 0x8c)
+          {
+            /* 0x8c = "enrollment buffer full" WITHOUT a good template — happens when the samples
+             * are too similar (fast repeated presses). Committing it gives 0x8e (unmatchable).
+             * Fail and ask for diverse coverage; only 0x59 is a real completion. */
+            fp_warn ("enroll: 0x8c = buffer full, template NOT good (samples too similar)");
+            fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                "enroll incomplete: press DIFFERENT parts of the finger (tip, sides, centre) each time"));
+            return;
           }
         if (rc == 0)
           {
@@ -491,33 +583,66 @@ enroll_run (FpiSsm *ssm, FpDevice *dev)
           }
         if (self->submits > EN_MAX_SUBMITS)
           { fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL, "enrollment did not complete")); return; }
-        fpi_ssm_jump_to_state (ssm, EN_POLL);
+        /* Windows re-issues 0x8a BEGIN before every capture+submit cycle (structural diff proven
+         * from enroll3-decrypted.txt: 0x8a→0x66→0x6c per sample). Our old single-begin loop made
+         * the chip never finalize a template (no prefix-flip). Re-begin each sample. */
+        self->poll_count = 0;
+        fpi_ssm_jump_to_state (ssm, EN_BEGIN);
       }
       break;
     case EN_CREATE:
-      /* The real CV enroll flow has NO 0x6f create_template (verified byte-for-byte against
-       * the CV3 plaintext capture: 0x02 -> 0x8a -> (0x66 -> 0x6c)xN -> 0x68 -> 0x6e -> 0x04).
-       * The template is built on-chip from the accumulated 0x6c submits; the speculative
-       * 0x6f errored (0x73) and invalidated the enrollment before commit. Skip to commit. */
-      fp_warn ("enroll: 0x68 end result +0x14=0x%x -> commit", self->result_code);
-      fpi_ssm_jump_to_state (ssm, EN_COMMIT);
+      /* Windows re-opens the enrollment object WITH the feature-ref (0x02 body =
+       * {tag0 len4 0x4d}{tag1 len16 FEATURE_CONTAINER}{tag1 len20 feature_ref}{tag1 len0}) just
+       * before the 0x6e commit (capture f1627), so the committed template is tagged with the ref.
+       * Verify replays this exact open to LOAD the template for matching. */
+      fp_warn ("enroll: 0x68 end +0x14=0x%x -> feature-ref open", self->result_code);
+      {
+        guint8 b[72]; guint8 *p = b;
+        guint32 v = GUINT32_TO_LE (0x4d); p = tlv_put (p, &v, 4);        /* {tag0 len4 0x4d} */
+        v = GUINT32_TO_LE (1); memcpy (p, &v, 4); p += 4;               /* {tag1 len16 container} */
+        v = GUINT32_TO_LE (16); memcpy (p, &v, 4); p += 4;
+        memcpy (p, FEATURE_CONTAINER, 16); p += 16;
+        v = GUINT32_TO_LE (1); memcpy (p, &v, 4); p += 4;               /* {tag1 len20 feature_ref} */
+        v = GUINT32_TO_LE (20); memcpy (p, &v, 4); p += 4;
+        memcpy (p, self->feature_ref, 20); p += 20;
+        v = GUINT32_TO_LE (1); memcpy (p, &v, 4); p += 4;               /* {tag1 len0} */
+        memset (p, 0, 4); p += 4;
+        cv_enc (dev, 0x02, 0x0440, b, p - b, FALSE);
+      }
       break;
     case EN_COMMIT:
 #if EN_COMMIT_ENABLED
       {
-        fp_warn ("enroll: committing (0x6e)");
-        guint8 body[64]; guint8 *p = body;
+        /* the feature-ref open returned a fresh handle for the tagged template object; commit on it */
+        if (self->resp_len >= 12) memcpy (self->obj_handle, self->resp + 8, 4);
+        fp_warn ("enroll: committing (0x6e) on handle %02x%02x%02x%02x",
+                 self->obj_handle[0], self->obj_handle[1], self->obj_handle[2], self->obj_handle[3]);
+        /* Commit body replicated BYTE-FOR-BYTE from the DECRYPTED Windows CV2 enroll
+         * (fp-reference-PRIVATE/win10-watch-enroll-GOOD): {tag0 len4 handle} +
+         * {tag0 len20 template-id} + {tag2 len8} + {tag2 len21 "BroadcomWBF" WBF-engine
+         * metadata} + trailing tag3. The old 20-zeros/empty-tag2 body (from the CV3 capture)
+         * made this CV2 chip reject the commit with 0x8e; Windows' real metadata is what the
+         * chip needs to finalize a matchable template (its commit returned rc=0). */
+        guint8 body[96]; guint8 *p = body;
         p = tlv_put (p, self->obj_handle, 4);                 /* {tag0 len4 handle} */
-        /* {tag0 len0x14 = 20 ZEROS}. Verified against the CV3 plaintext capture: the commit's
-         * 20-byte field is all zeros and the tag2/tag2/tag3 params are empty — the template is
-         * already stored on-chip from the 0x6c submits. A non-zero id (e.g. SHA1 of the
-         * username) stored it under a hash the empty-hash identify (0x73) could not find. */
-        guint8 id[20] = { 0 };
-        p = tlv_put (p, id, 20);
-        /* trailing fields verbatim from the capture: {tag2 len0}{tag2 len0}{tag3 len0} */
-        static const guint8 tail[24] = { 2,0,0,0, 0,0,0,0,  2,0,0,0, 0,0,0,0,  3,0,0,0, 0,0,0,0 };
-        memcpy (p, tail, 24); p += 24;
-        cv_enc (dev, 0x6e, 0x0440, body, 64, FALSE);
+        static const guint8 rest[84] = {
+          0x00,0x00,0x00,0x00,0x14,0x00,0x00,0x00,0x2b,0xcf,0x51,0x35,
+          0x84,0xc4,0x1b,0x3f,0x12,0xfc,0x90,0x28,0x0e,0xd8,0x33,0x99,
+          0x4c,0x92,0x82,0xae,0x02,0x00,0x00,0x00,0x08,0x00,0x00,0x00,
+          0x00,0x00,0x04,0x00,0x04,0x00,0x00,0x00,0x02,0x00,0x00,0x00,
+          0x15,0x00,0x00,0x00,0x01,0x01,0xff,0x00,0x00,0x00,0x0d,0x00,
+          0x0c,0x42,0x72,0x6f,0x61,0x64,0x63,0x6f,0x6d,0x57,0x42,0x46,
+          0x00,0x00,0x00,0x00,0x03,0x00,0x00,0x00,0x00,0x08,0x00,0x00,
+        };
+        memcpy (p, rest, sizeof rest); p += sizeof rest;
+        /* Replace the hardcoded stale 20-byte template-id (rest[8:28] -> body[20:40]) with the
+         * REAL id the chip returned in the final 0x6c response. Committing under the chip's own id
+         * is what lets verify's chip-side lookup find the template (fixes the 0x85 no-match). */
+        const guint8 *tid = self->have_tid ? self->template_id : self->digest;
+        memcpy (body + 20, tid, 20);
+        fp_warn ("enroll: committing template-id %02x%02x%02x%02x… (%s)",
+                 tid[0], tid[1], tid[2], tid[3], self->have_tid ? "chip" : "fallback=last-digest");
+        cv_enc (dev, 0x6e, 0x0440, body, p - body, FALSE);
       }
       break;
 #else
@@ -527,6 +652,12 @@ enroll_run (FpiSsm *ssm, FpDevice *dev)
     case EN_CLOSE:
       {
         fp_warn ("enroll: 0x6e commit result +0x14=0x%x", self->result_code);
+        {
+          GString *hx = g_string_new (NULL);
+          for (gsize i = 0; i < self->resp_len && i < 128; i++) g_string_append_printf (hx, "%02x", self->resp[i]);
+          fp_warn ("RAW 0x6e commit resp (%zu B): %s", self->resp_len, hx->str);
+          g_string_free (hx, TRUE);
+        }
         guint8 body[12]; tlv_put (body, self->obj_handle, 4);
         cv_enc (dev, 0x04, 0x0040, body, sizeof body, FALSE);
       }
@@ -562,9 +693,12 @@ dev_enroll (FpDevice *dev)
 {
   FpiDeviceBcm5880Cv2 *self = FPI_DEVICE_BCM5880CV2 (dev);
   fpi_device_get_enroll_data (dev, &self->enroll_print);
+  compute_feature_ref (self->enroll_print, self->feature_ref);
+  fp_warn ("enroll: feature-ref = %02x%02x%02x%02x…", self->feature_ref[0], self->feature_ref[1], self->feature_ref[2], self->feature_ref[3]);
   self->enroll_stage = 0;
   self->submits = 0;
   self->nsamples = 0;
+  self->have_tid = FALSE;
   self->poll_count = 0;
   self->task_ssm = fpi_ssm_new (dev, enroll_run, EN_NUM);
   fpi_ssm_start (self->task_ssm, enroll_done);
@@ -580,30 +714,72 @@ dev_enroll (FpDevice *dev)
 #define VER_MAX_POLLS 40
 
 static guint8 *
-build_73 (const guint8 handle[4], const guint8 *probe, gsize probe_len, const guint8 *hash, gsize *len)
+build_73 (const guint8 handle[4], gsize *len)
 {
-  /* identify body (from cv_do_fingerprint_identify disasm):
-   *   {tag0 handle}{tag0 0x48}{tag0 0x53e2}{tag0 0}{tag2 = probe feature}{tag3 = template hash}
-   * The tag2 carries the just-captured probe digest (relayed from the 0x66 capture, exactly like
-   * the enroll 0x6c relays its digest) so the chip has something to match; the arm call passes none.
-   * tag3 is the optional template id to match against (w_hash); empty = match any. */
-  gsize hl = hash ? 20 : 0;
-  guint8 *b = g_malloc0 (64 + probe_len + hl); guint8 *p = b;
+  /* identify body — EXACT structure from the DECRYPTED Windows verify (verify-decoded.txt, f421):
+   *   {tag0 len4 = SESSION_HANDLE}{tag0 len4 = 0x148}{tag0 len4 = 0x53e2}{tag0 len4 = 0}
+   *   {tag2 len4 = PROBE_REF}{tag3 len=20, NO value bytes = declared output buffer}
+   * handle = the plain 0x02-opened capture session (Windows runs 0x73 on empty-opened sessions);
+   * 0x148 + 0x53e2 fixed params; tag2 0x10d1e8 = live-probe slot the chip echoes on MATCH.
+   * Verdict is in the RESPONSE BODY first tag0 (1=match/0=no-match), NOT +0x14. */
+  guint8 *b = g_malloc0 (72); guint8 *p = b;
   guint32 v;
   p = tlv_put (p, handle, 4);
-  v = GUINT32_TO_LE (0x48);   p = tlv_put (p, &v, 4);
+  v = GUINT32_TO_LE (0x148);  p = tlv_put (p, &v, 4);
   v = GUINT32_TO_LE (0x53e2); p = tlv_put (p, &v, 4);
   v = GUINT32_TO_LE (0);      p = tlv_put (p, &v, 4);
-  v = GUINT32_TO_LE (2);           memcpy (p, &v, 4); p += 4;   /* tag2 = probe feature */
-  v = GUINT32_TO_LE (probe_len);   memcpy (p, &v, 4); p += 4;
-  if (probe_len) { memcpy (p, probe, probe_len); p += probe_len; }
-  v = GUINT32_TO_LE (3);  memcpy (p, &v, 4); p += 4;            /* tag3 = template hash */
-  v = GUINT32_TO_LE (hl); memcpy (p, &v, 4); p += 4;
-  if (hl) { memcpy (p, hash, hl); p += hl; }
+  v = GUINT32_TO_LE (2);          memcpy (p, &v, 4); p += 4;   /* tag2 = probe-ref */
+  v = GUINT32_TO_LE (4);          memcpy (p, &v, 4); p += 4;
+  v = GUINT32_TO_LE (PROBE_REF);  memcpy (p, &v, 4); p += 4;
+  v = GUINT32_TO_LE (3);          memcpy (p, &v, 4); p += 4;   /* tag3: declare 20-byte out buffer, */
+  v = GUINT32_TO_LE (20);         memcpy (p, &v, 4); p += 4;   /* NO value bytes (body ends here, plen 68) */
   *len = p - b; return b;
 }
 
-enum { VER_OPEN, VER_ARM, VER_CAPTURE, VER_SUBMIT, VER_CHECK, VER_CLOSE, VER_DONE, VER_NUM };
+/* build the feature-ref template-LOAD open body: {tag0 len4 0x4d}{tag1 len16 CONTAINER}
+ * {tag1 len20 feature_ref}{tag1 len0} — same as the enroll commit-open; loads the stored template. */
+static guint8 *
+build_load (const guint8 feature_ref[20], gsize *len)
+{
+  guint8 *b = g_malloc0 (72); guint8 *p = b;
+  guint32 v = GUINT32_TO_LE (0x4d); p = tlv_put (p, &v, 4);
+  v = GUINT32_TO_LE (1); memcpy (p, &v, 4); p += 4; v = GUINT32_TO_LE (16); memcpy (p, &v, 4); p += 4;
+  memcpy (p, FEATURE_CONTAINER, 16); p += 16;
+  v = GUINT32_TO_LE (1); memcpy (p, &v, 4); p += 4; v = GUINT32_TO_LE (20); memcpy (p, &v, 4); p += 4;
+  memcpy (p, feature_ref, 20); p += 20;
+  v = GUINT32_TO_LE (1); memcpy (p, &v, 4); p += 4; memset (p, 0, 4); p += 4;
+  *len = p - b; return b;
+}
+
+/* build the 0x6e commit/re-commit body: {tag0 handle}{tag0 len20 id}{tag2 0000040004000000}
+ * {tag2 "BroadcomWBF" meta}{tag3}. Used by enroll (id=template-id) AND verify (id=probe-id, to
+ * merge the probe into the loaded template before identify — Windows f329). */
+static guint8 *
+build_6e (const guint8 handle[4], const guint8 id[20], gsize *len)
+{
+  guint8 *b = g_malloc0 (96); guint8 *p = b;
+  p = tlv_put (p, handle, 4);
+  static const guint8 rest[84] = {
+    0x00,0x00,0x00,0x00,0x14,0x00,0x00,0x00,0x2b,0xcf,0x51,0x35,
+    0x84,0xc4,0x1b,0x3f,0x12,0xfc,0x90,0x28,0x0e,0xd8,0x33,0x99,
+    0x4c,0x92,0x82,0xae,0x02,0x00,0x00,0x00,0x08,0x00,0x00,0x00,
+    0x00,0x00,0x04,0x00,0x04,0x00,0x00,0x00,0x02,0x00,0x00,0x00,
+    0x15,0x00,0x00,0x00,0x01,0x01,0xff,0x00,0x00,0x00,0x0d,0x00,
+    0x0c,0x42,0x72,0x6f,0x61,0x64,0x63,0x6f,0x6d,0x57,0x42,0x46,
+    0x00,0x00,0x00,0x00,0x03,0x00,0x00,0x00,0x00,0x08,0x00,0x00,
+  };
+  memcpy (p, rest, sizeof rest); p += sizeof rest;
+  memcpy (b + 20, id, 20);                      /* id at body[20:40] */
+  *len = p - b; return b;
+}
+
+/* Windows verify = 3 phases: (1) build the PROBE as a mini-enroll (0x8a→0x66→0x6c looped until the
+ * 0x6c response prefix-flips 00->01, yielding a probe-id); (2) LOAD each template (feature-ref open)
+ * and 0x6e RE-COMMIT it with the probe-id; (3) 0x73 identify(template, tag2=PROBE_REF) -> body verdict. */
+/* SIMPLE verify: per round, capture on the CAPTURE session, then open a FRESH session and run
+ * 0x73 identify ON THAT fresh handle (Windows uses a different handle for 0x66 vs 0x73 — f377 vs
+ * f421). Loop ≥2 rounds (Windows' first 0x73 returns 0, the second returns 1=match). */
+enum { VER_OPEN, VER_CAPTURE, VER_OPENID, VER_IDENTIFY, VER_CHECK, VER_CLOSE, VER_DONE, VER_NUM };
 
 static void
 verify_run (FpiSsm *ssm, FpDevice *dev)
@@ -613,66 +789,66 @@ verify_run (FpiSsm *ssm, FpDevice *dev)
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case VER_OPEN:
+      /* SIMPLE verify (both advisors): open a plain session, then capture→identify looped a few
+       * rounds. NO 0x5d / 0x6d / 0x8a / 0x6c / 0x6e / template-load / recommit — the probe-build
+       * half of verify-decoded.txt was an ENROLL; the real verify blocks (f371+) are just 0x66→0x73. */
       cv_enc (dev, 0x02, 0x0440, BODY_02, sizeof BODY_02, FALSE);
       break;
-    case VER_ARM:
-      {
-        /* object handle came back in the 0x02 response */
-        if (self->resp_len < 12) { fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_PROTO)); return; }
-        memcpy (self->obj_handle, self->resp + 8, 4);
-        /* 0x73 arms the verify capture (like 0x8a arms the enroll capture); no probe yet */
-        gsize n; guint8 *b = build_73 (self->obj_handle, NULL, 0, NULL, &n);
-        cv_enc (dev, 0x73, 0x0442, b, n, TRUE);
-        g_free (b);
-      }
-      break;
     case VER_CAPTURE:
+      if (!(self->obj_handle[0] | self->obj_handle[1] | self->obj_handle[2] | self->obj_handle[3])
+          && self->resp_len >= 12)
+        memcpy (self->obj_handle, self->resp + 8, 4);
       {
-        /* poll the capture until a finger is present */
-        gsize n; guint8 *b = build_66 (self->obj_handle, &n);
+        gsize n; guint8 *b = build_66 (self->obj_handle, 0x23, &n);
         cv_enc (dev, 0x66, 0x0442, b, n, TRUE);
         g_free (b);
       }
       break;
-    case VER_SUBMIT:
+    case VER_OPENID:
       {
+        /* 0x66 response. No finger / 0x85 pending -> re-poll. Else open a FRESH session for 0x73
+         * (Windows runs identify on a different handle than capture). */
         guint8 *r = self->resp; gsize rl = self->resp_len;
-        if (rl < 28)                                  /* no finger yet -> keep polling */
+        if (rl < 28)
           {
+            fp_warn ("verify: 0x66 empty rc=0x%x poll=%u", self->result_code, self->poll_count);
             if (++self->poll_count > VER_MAX_POLLS)
-              { fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL, "no finger (timeout)")); return; }
+              { self->verify_matched = FALSE; fp_warn ("verify: no finger (timeout)"); fpi_ssm_jump_to_state (ssm, VER_CLOSE); return; }
             fpi_ssm_jump_to_state (ssm, VER_CAPTURE);
             return;
           }
+        self->poll_count = 0;
         memcpy (self->digest, r + 8, 20);
-        fp_warn ("verify: captured finger %02x%02x%02x%02x…", self->digest[0], self->digest[1], self->digest[2], self->digest[3]);
-        /* match the just-captured finger against the stored templates — relay the captured
-         * probe digest in tag2 so the chip has the finger to compare (was empty before) */
-        gsize n; guint8 *b = build_73 (self->obj_handle, self->digest, 20, NULL, &n);
+        fp_warn ("verify: captured %02x%02x%02x%02x… (round %u) -> open fresh id session", r[8], r[9], r[10], r[11], self->submits);
+        cv_enc (dev, 0x02, 0x0440, BODY_02, sizeof BODY_02, FALSE);
+      }
+      break;
+    case VER_IDENTIFY:
+      {
+        /* fresh session handle for the identify (NOT the capture handle) */
+        if (self->resp_len >= 12) memcpy (self->tmpl_handle, self->resp + 8, 4);
+        fp_warn ("verify: 0x73 identify on fresh handle %02x%02x%02x%02x",
+                 self->tmpl_handle[0], self->tmpl_handle[1], self->tmpl_handle[2], self->tmpl_handle[3]);
+        gsize n; guint8 *b = build_73 (self->tmpl_handle, &n);
         cv_enc (dev, 0x73, 0x0442, b, n, TRUE);
         g_free (b);
       }
       break;
     case VER_CHECK:
-      fp_warn ("verify: 0x73 result +0x14 = 0x%x (attempt %u)", self->result_code, self->poll_count);
-      if (self->result_code == 0)
-        {
-          self->verify_matched = TRUE;
-          fp_warn ("verify: MATCH ✓");
-          fpi_ssm_jump_to_state (ssm, VER_CLOSE);
-          break;
-        }
-      /* 0x89 = no finger yet, 0x85 = this sample didn't match. Each 0x73 is a fresh
-       * capture+identify, so keep retrying (re-capture + re-identify) to give the user
-       * time to present the finger well — report no-match only after exhausting the window. */
-      if (++self->poll_count <= VER_MAX_POLLS)
-        {
-          fpi_ssm_jump_to_state (ssm, VER_CAPTURE);
-          return;
-        }
-      self->verify_matched = FALSE;
-      fp_warn ("verify: no match (exhausted %u attempts)", self->poll_count);
-      fpi_ssm_jump_to_state (ssm, VER_CLOSE);
+      {
+        /* full body dump + verdict (body first-tag0: 1=match / 0=no-match; NOT +0x14). Windows does
+         * ~2 identify rounds (first often 0, second 1), so loop a few capture→identify rounds. */
+        GString *h = g_string_new (NULL);
+        for (gsize i = 0; i < self->resp_len && i < 44; i++) g_string_append_printf (h, "%02x", self->resp[i]);
+        guint32 verdict = (self->resp_len >= 12) ? GUINT32_FROM_LE (*(guint32 *) (self->resp + 8)) : 0xff;
+        fp_warn ("verify: 0x73 round %u verdict=%u hdr+0x14=0x%x body=%s", self->submits, verdict, self->result_code, h->str);
+        g_string_free (h, TRUE);
+        if (verdict == 1)
+          { self->verify_matched = TRUE; fp_warn ("verify: MATCH ✓"); fpi_ssm_jump_to_state (ssm, VER_CLOSE); break; }
+        if (self->submits++ >= 6)
+          { self->verify_matched = FALSE; fp_warn ("verify: no match (rounds exhausted)"); fpi_ssm_jump_to_state (ssm, VER_CLOSE); break; }
+        fpi_ssm_jump_to_state (ssm, VER_CAPTURE);                   /* next capture→identify round */
+      }
       break;
     case VER_CLOSE:
       {
@@ -710,7 +886,13 @@ vhs_done (FpiSsm *ssm, FpDevice *dev, GError *error)
   FpiDeviceBcm5880Cv2 *self = FPI_DEVICE_BCM5880CV2 (dev);
   if (error) { fp_warn ("verify handshake failed: %s", error->message); fpi_device_verify_complete (dev, error); return; }
   self->poll_count = 0;
+  self->submits = 0;
   self->verify_matched = FALSE;
+  self->have_probe = FALSE;
+  memset (self->obj_handle, 0, 4);
+  memset (self->tmpl_handle, 0, 4);
+  memset (self->scratch_cur, 0, 4);
+  memset (self->scratch_prev, 0, 4);
   self->task_ssm = fpi_ssm_new (dev, verify_run, VER_NUM);
   fpi_ssm_start (self->task_ssm, verify_done);
 }
@@ -733,6 +915,9 @@ dev_verify (FpDevice *dev)
       g_checksum_get_digest (ck, self->verify_hash, &dl);
       g_checksum_free (ck);
     }
+  /* same feature-ref the enroll tagged the template with -> used to LOAD it for identify */
+  compute_feature_ref (print, self->feature_ref);
+  fp_warn ("verify: feature-ref = %02x%02x%02x%02x…", self->feature_ref[0], self->feature_ref[1], self->feature_ref[2], self->feature_ref[3]);
   self->task_ssm = fpi_ssm_new (dev, open_run, OPEN_NUM);
   fpi_ssm_start (self->task_ssm, vhs_done);
 }
